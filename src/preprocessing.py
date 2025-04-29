@@ -80,7 +80,6 @@ def create_dirtiness_map(
     # minimum recompute
     maxnum = 10
     while dirtiness_map.mean() < 0.1:
-
         dirtiness_map = expand_mask_neighbors(dirtiness_map)
 
         maxnum -= 1
@@ -92,7 +91,7 @@ def create_dirtiness_map(
 def estimate_affine_in_padded_anchor(
     anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
     target_ndarray: np.ndarray,         # (H, W, 3)
-):
+) -> np.ndarray:
     # Find and match keypoints
     orb = cv2.ORB_create()
     kp1, des1 = orb.detectAndCompute(target_ndarray, None)
@@ -114,6 +113,41 @@ def estimate_affine_in_padded_anchor(
     affine_matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, cv2.LMEDS, maxIters=5000, confidence=0.999, refineIters=10)
 
     return affine_matrix
+
+def estimate_affine_in_padded_anchor_fast(
+    anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
+    target_ndarray: np.ndarray,         # (H, W, 3)
+) -> np.ndarray:
+
+    # Resize images into a half
+    anchor_padded_ndarray = cv2.resize(anchor_padded_ndarray, (anchor_padded_ndarray.shape[1] // 2, anchor_padded_ndarray.shape[0] // 2), interpolation=cv2.INTER_LINEAR)
+    target_ndarray = cv2.resize(target_ndarray, (target_ndarray.shape[1] // 2, target_ndarray.shape[0] // 2), interpolation=cv2.INTER_LINEAR)
+
+    # Find and match keypoints
+    orb = cv2.ORB_create()
+    kp1, des1 = orb.detectAndCompute(target_ndarray, None)
+    kp2, des2 = orb.detectAndCompute(anchor_padded_ndarray, None)
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    # Select good matches
+    good_matches = matches[:min(len(matches), 100)]
+
+    # Extract coordinates of matching points
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    # Calculate Affine Transform
+    # affine_matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=3.0)
+    affine_matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, cv2.LMEDS, maxIters=5000, confidence=0.999, refineIters=10)
+
+    # Restore the scale
+    affine_matrix[:, 2] *= 2
+
+    return affine_matrix
+
 
 def estimate_translation_in_padded_anchor(
     anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
@@ -210,7 +244,7 @@ def affine_ground_truth_boxes(
 def get_padded_image(
     image_ndarray: np.ndarray, 
     size: Tuple[int, int], 
-    basic_scaling_factor: float = 1.05
+    basic_scaling_factor: float = 1.0
 ) -> np.ndarray:
     image_scaled = cv2.resize(image_ndarray, (int(image_ndarray.shape[1] * basic_scaling_factor), int(image_ndarray.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
 
@@ -296,3 +330,24 @@ def bytes_to_ndarray(data: bytes) -> np.ndarray:
     return np.frombuffer(array_data, dtype=dtype).reshape(shape)
     
 
+def load_video(video_path: str) -> List[np.ndarray]:
+    """
+    Load a video file and return its frames.
+
+    Args:
+        video_path (str): Path to the video file.
+
+    Returns:
+        List[np.ndarray]: List of frames from the video.
+    """
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(frame)
+
+    cap.release()
+    return frames

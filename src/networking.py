@@ -12,7 +12,7 @@ HEADER_TERMINATE = 1
 def connect_dual_tcp(
     host: str,
     ports: Tuple[int, int] = (65432, 65433),
-    type: str = "server"
+    node_type: str = "server"
 ) -> Tuple[socket.socket, socket.socket]:
     """
     Connect to a dual TCP socket.
@@ -34,7 +34,7 @@ def connect_dual_tcp(
 
     """
 
-    if type == "server":
+    if node_type == "server":
         # Create server sockets
         server_sockets = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in ports]
         for server_socket, port in zip(server_sockets, ports):
@@ -51,11 +51,12 @@ def connect_dual_tcp(
 
         return tuple(connections)
 
-    elif type == "client":
+    elif node_type == "client":
         # Create client sockets
         client_sockets = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in ports]
         for client_socket, port in zip(client_sockets, ports):
             while True:
+                print(f"Trying to connect to {host}:{port}")
                 try:
                     client_socket.connect((host, port))
                     print(f"Connected to {host}:{port}")
@@ -119,6 +120,55 @@ def receive_data(socket: socket.socket, buffer_size: int = 1024) -> bytes | None
     
     return data
 
+def measure_timelag(socket_rx: socket.socket, socket_tx: socket.socket, node_type: str) -> float:
+    """
+    Measure the time lag between sending and receiving data over a socket.
+    ping-pong and measure the RTT.
+    client time + lag = server time
+    server time - lag = client time
+
+    Args:
+        socket_rx (socket.socket): The socket object to receive data from.
+        socket_tx (socket.socket): The socket object to send data to.
+        node_type (str): The type of connection ('server' or 'client').
+
+    Returns:
+        float: The time lag in seconds.
+    """
+    num_repeats = 10
+    lags = []
+
+    if node_type == "client":
+        for _ in range(num_repeats):
+            timestamp_client_send = time.time()
+            timestamp_client_send_data = str(timestamp_client_send).encode('utf-8')
+            transmit_data(socket_tx, timestamp_client_send_data)
+            data = receive_data(socket_rx)
+            timestamp_server = float(data.decode('utf-8'))
+            timestamp_client_recv = time.time()
+
+            client_mid = (timestamp_client_send + timestamp_client_recv) / 2
+            
+            lag = timestamp_server - client_mid
+            lags.append(lag)
+
+        lag_avg = sum(lags) / len(lags)
+        transmit_data(socket_tx, str(lag_avg).encode('utf-8'))
+
+    elif node_type == "server":
+        for _ in range(num_repeats):
+            data = receive_data(socket_rx)
+            timestamp_server = str(time.time()).encode('utf-8')
+            transmit_data(socket_tx, timestamp_server)
+
+        data = receive_data(socket_rx)
+        lag_avg = float(data.decode('utf-8'))
+
+    else:
+        raise ValueError("Invalid type. Use 'server' or 'client'.")
+
+    return lag_avg
+
 
 # Example usage
 if __name__ == "__main__":
@@ -128,7 +178,7 @@ if __name__ == "__main__":
     # get the first system arguments
     proc_type = sys.argv[1] if len(sys.argv) > 1 else "server"
 
-    socket_rx, socket_tx = connect_dual_tcp("localhost", (65432, 65433), type=proc_type)
+    socket_rx, socket_tx = connect_dual_tcp("localhost", (9000, 9001), node_type=proc_type)
     
     # random test message
     test_message = "Hello, this is a test message. "
@@ -139,11 +189,18 @@ if __name__ == "__main__":
         print(f"Server sent: {test_message}")
         received = receive_data(socket_rx)
         print(f"Server received: {received.decode()}")
+
+        lag_avg = measure_timelag(socket_rx, socket_tx, proc_type)
+        print(f"Average lag: {lag_avg:.6f} seconds")
+
     elif proc_type == "client":
         received = receive_data(socket_rx)
         print(f"Client received: {received.decode()}")
         transmit_data(socket_tx, test_message.encode())
         print(f"Client sent: {test_message}")
+
+        lag_avg = measure_timelag(socket_rx, socket_tx, proc_type)
+        print(f"Average lag: {lag_avg:.6f} seconds")
     
     socket_rx.close()
     socket_tx.close()

@@ -18,9 +18,15 @@ from typing import List, Tuple
 
 from networking import (
     HEADER_NORMAL, HEADER_TERMINATE,
-    connect_dual_tcp, transmit_data, receive_data
+    connect_dual_tcp, transmit_data, receive_data,
+    measure_timelag,
 )
-from preprocessing import ndarray_to_bytes, bytes_to_ndarray
+from preprocessing import (
+    estimate_affine_in_padded_anchor, apply_affine_and_pad, get_padded_image,
+    estimate_affine_in_padded_anchor_fast,
+    create_dirtiness_map,
+    ndarray_to_bytes, bytes_to_ndarray
+)
 
 
 def thread_process_video(socket_rx: socket.socket, socket_tx: socket.socket, device: str='cuda') -> float:
@@ -38,12 +44,24 @@ def thread_process_video(socket_rx: socket.socket, socket_tx: socket.socket, dev
     model = MaskedRCNN_ViT_B_FPN_Contexted(device=device)
     model.load_weight("models/model_final_61ccd1.pkl")
     model.eval()
+    print('Model loaded and ready to process frames.')
+
+    transmit_data(socket_tx, b"start!")
 
     start_timestamp = time.time()
 
+    # Sizes: H, W
+    input_size = (1024, 1024)
+    frame_size = (854, 480)
+
+    gop = 30
     num_frames = 0
-    feature_cache = None
+    anchor_image_padded = None
+    anchor_features = None
+    compute_rates = []
+
     while True:
+        # Receive frame
         data = receive_data(socket_rx)
         if data is None:
             transmit_data(socket_tx, b"", HEADER_TERMINATE)
@@ -52,10 +70,45 @@ def thread_process_video(socket_rx: socket.socket, socket_tx: socket.socket, dev
         fidx = int.from_bytes(data[:4], 'big')
 
         frame = bytes_to_ndarray(receive_data(socket_rx))
-        print(f"Received frame {fidx} of shape: {frame.shape}")
+        print(f"Received {fidx} | frame: {frame.shape} | timestamp: {time.time()}")
 
-        # Process the frame with the model
-        (boxes, scores, labels), _ = model.forward_contexted(frame)
+        target_ndarray = cv2.resize(frame, frame_size)
+
+        # Preprocess the frame
+        refresh = False
+        if fidx % gop == 0 or anchor_image_padded is None or anchor_features is None:
+            refresh = True
+        else:
+            # try image refinement
+            # affine_matrix = estimate_affine_in_padded_anchor(anchor_image_padded, frame)
+            affine_matrix = estimate_affine_in_padded_anchor_fast(anchor_image_padded, frame)
+            target_padded_ndarray = apply_affine_and_pad(target_ndarray, affine_matrix)
+            
+            scaling_factor = np.linalg.norm(affine_matrix[:2, :2])
+            dirtiness_map = create_dirtiness_map(anchor_image_padded, target_padded_ndarray)
+            
+            refresh |= (target_padded_ndarray is None)
+            refresh |= (scaling_factor < 0.95)
+        
+        # Process the frame
+        if refresh:
+            target_padded_ndarray = get_padded_image(target_ndarray, input_size)
+            (boxes, labels, scores), cached_features_dict = model.forward_contexted(target_padded_ndarray)
+            dirtiness_map = torch.ones(1, 64, 64, 1)
+        else:
+            (boxes, labels, scores), cached_features_dict = model.forward_contexted(
+                target_padded_ndarray,
+                anchor_features=anchor_features,
+                dirtiness_map=dirtiness_map
+            )
+        
+        anchor_image_padded = target_padded_ndarray
+        anchor_features = cached_features_dict
+
+        cv2.imwrite(f"recv/{fidx:05d}.jpg", target_padded_ndarray)
+        
+        # Statistics
+        compute_rates.append(dirtiness_map.mean().item())
 
         # Convert results to bytes
         transmit_data(socket_tx, fidx.to_bytes(4, 'big'))
@@ -68,6 +121,7 @@ def thread_process_video(socket_rx: socket.socket, socket_tx: socket.socket, dev
     end_timestamp = time.time()
 
     print(f"Frame rate: {num_frames / (end_timestamp - start_timestamp)} FPS")
+    print(f"Compute rate: {np.mean(compute_rates)}")
 
     return end_timestamp - start_timestamp
 
@@ -78,7 +132,10 @@ def main(args):
     device = args.device
 
     # Connect to the client
-    socket_rx, socket_tx = connect_dual_tcp(server_ip, (server_port1, server_port2), type="server")
+    socket_rx, socket_tx = connect_dual_tcp(server_ip, (server_port1, server_port2), node_type="server")
+
+    timelag = measure_timelag(socket_rx, socket_tx, "server")
+    print(f"Timelag: {timelag} seconds")
 
     # Prepare processes
     thread_proc = Process(target=thread_process_video, args=(socket_rx, socket_tx, device))

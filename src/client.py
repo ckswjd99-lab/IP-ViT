@@ -17,32 +17,10 @@ from typing import List, Tuple
 
 from networking import (
     HEADER_NORMAL, HEADER_TERMINATE,
-    connect_dual_tcp, transmit_data, receive_data
+    connect_dual_tcp, transmit_data, receive_data,
+    measure_timelag,
 )
-from preprocessing import ndarray_to_bytes, bytes_to_ndarray
-
-
-def load_video(video_path: str) -> List[np.ndarray]:
-    """
-    Load a video file and return its frames.
-
-    Args:
-        video_path (str): Path to the video file.
-
-    Returns:
-        List[np.ndarray]: List of frames from the video.
-    """
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(frame)
-
-    cap.release()
-    return frames
+from preprocessing import ndarray_to_bytes, bytes_to_ndarray, load_video
 
 
 def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float=30) -> float:
@@ -65,8 +43,7 @@ def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float=
         # Encode the frame
         transmit_data(socket, ndarray_to_bytes(frame))
 
-        print(f"Sent frame {fidx} of shape {frame.shape}")
-        time.sleep(1 / frame_rate)  # Control the frame rate
+        print(f"Transferred {fidx} | frame: {frame.shape} | timestamp: {time.time()}")
 
     transmit_data(socket, b"", HEADER_TERMINATE)  # Send termination signal
     end_timestamp = time.time()
@@ -81,7 +58,6 @@ def thread_receive_results(socket: socket.socket) -> float:
     Args:
         socket (socket.socket): The socket object to receive data from.
     """
-    start_timestamp = time.time()
     while True:
         data = receive_data(socket)
         if data is None:
@@ -92,12 +68,8 @@ def thread_receive_results(socket: socket.socket) -> float:
         scores = bytes_to_ndarray(receive_data(socket))
         labels = bytes_to_ndarray(receive_data(socket))
 
-        print(f"Received {fidx} | boxes: {boxes.shape}, scores: {scores.shape}, labels: {labels.shape}")
+        print(f"Received {fidx} | boxes: {boxes.shape}, scores: {scores.shape}, labels: {labels.shape} | timestamp: {time.time()}")
         
-
-    end_timestamp = time.time()
-    return end_timestamp - start_timestamp
-
 
 def main(args):
     server_ip = args.server_ip
@@ -107,13 +79,15 @@ def main(args):
     frame_rate = args.frame_rate
 
     # Connect to the server
-    socket_rx, socket_tx = connect_dual_tcp(server_ip, (server_port1, server_port2), type="client")
+    socket_rx, socket_tx = connect_dual_tcp(server_ip, (server_port1, server_port2), node_type="client")
+
+    timelag = measure_timelag(socket_rx, socket_tx, "client")
+    print(f"Timelag: {timelag} seconds")
 
     # Prepare processes
     thread_recv = Process(target=thread_receive_results, args=(socket_rx,))
     thread_send = Process(target=thread_send_video, args=(socket_tx, video_path, frame_rate))
 
-    thread_recv.start()
 
     # Send metadata
     metadata = {
@@ -124,7 +98,10 @@ def main(args):
 
     print("Sent metadata:", metadata)
 
+    receive_data(socket_rx)  # Wait for server to be ready
+
     # Start sending video
+    thread_recv.start()
     thread_send.start()
 
     # Wait for the threads to finish
