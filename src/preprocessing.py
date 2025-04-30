@@ -118,10 +118,11 @@ def estimate_affine_in_padded_anchor_fast(
     anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
     target_ndarray: np.ndarray,         # (H, W, 3)
 ) -> np.ndarray:
+    scaler = 2
 
     # Resize images into a half
-    anchor_padded_ndarray = cv2.resize(anchor_padded_ndarray, (anchor_padded_ndarray.shape[1] // 2, anchor_padded_ndarray.shape[0] // 2), interpolation=cv2.INTER_LINEAR)
-    target_ndarray = cv2.resize(target_ndarray, (target_ndarray.shape[1] // 2, target_ndarray.shape[0] // 2), interpolation=cv2.INTER_LINEAR)
+    anchor_padded_ndarray = cv2.resize(anchor_padded_ndarray, (anchor_padded_ndarray.shape[1] // scaler, anchor_padded_ndarray.shape[0] // scaler), interpolation=cv2.INTER_LINEAR)
+    target_ndarray = cv2.resize(target_ndarray, (target_ndarray.shape[1] // scaler, target_ndarray.shape[0] // scaler), interpolation=cv2.INTER_LINEAR)
 
     # Find and match keypoints
     orb = cv2.ORB_create()
@@ -144,7 +145,7 @@ def estimate_affine_in_padded_anchor_fast(
     affine_matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, cv2.LMEDS, maxIters=5000, confidence=0.999, refineIters=10)
 
     # Restore the scale
-    affine_matrix[:, 2] *= 2
+    affine_matrix[:, 2] *= scaler
 
     return affine_matrix
 

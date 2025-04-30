@@ -35,6 +35,8 @@ def thread_receive_video(
     frame_queue: Queue,
     queue_recv_timestamp: Queue,
     queue_preproc_timestamp: Queue,
+    compress: bool,
+    gop: int,
 ) -> float:
     
     """
@@ -50,7 +52,6 @@ def thread_receive_video(
     input_size = (1024, 1024)
     frame_size = (854, 480)
 
-    gop = 30
     anchor_image_padded = None
 
     while True:
@@ -60,7 +61,13 @@ def thread_receive_video(
             break
 
         fidx = int.from_bytes(data[:4], 'big')
-        frame = bytes_to_ndarray(receive_data(socket_rx))
+
+        # Optionally decode the frame
+        if compress:
+            data = bytes_to_ndarray(receive_data(socket_rx))
+            frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        else:
+            frame = bytes_to_ndarray(receive_data(socket_rx))
         queue_recv_timestamp.put(time.time())
 
         target_ndarray = cv2.resize(frame, frame_size)
@@ -74,7 +81,7 @@ def thread_receive_video(
         else:
             # try image refinement
             # affine_matrix = estimate_affine_in_padded_anchor(anchor_image_padded, frame)
-            affine_matrix = estimate_affine_in_padded_anchor_fast(anchor_image_padded, frame)
+            affine_matrix = estimate_affine_in_padded_anchor_fast(anchor_image_padded, target_ndarray)
             target_padded_ndarray = apply_affine_and_pad(target_ndarray, affine_matrix)
             
             scaling_factor = np.linalg.norm(affine_matrix[:2, :2])
@@ -88,7 +95,9 @@ def thread_receive_video(
         queue_preproc_timestamp.put(time.time())
 
         # Put the frame into the queue
-        frame_queue.put((fidx, refresh, target_ndarray, dirtiness_map.cpu().numpy()))
+        frame_queue.put((fidx, refresh, target_padded_ndarray, dirtiness_map.cpu().numpy()))
+
+        cv2.imwrite(f"recv/{fidx:05d}.jpg", target_padded_ndarray)
         
     frame_queue.put((-1, None, None, None))  # Send termination signal
     
@@ -210,6 +219,16 @@ def main(args):
     timelag = measure_timelag(socket_rx, socket_tx, "server")
     print(f"Timelag: {timelag} seconds")
 
+    # Receive metadata
+    metadata = receive_data(socket_rx)
+    metadata = metadata.decode('utf-8')
+    metadata = eval(metadata)  # Convert string back to dictionary
+    
+    gop = metadata.get("gop", 30)
+    compress = metadata.get("compress", False)
+
+    print(f"Received metadata: {metadata}")
+
     # Prepare processes
     frame_queue = Queue(maxsize=100)
     result_queue = Queue(maxsize=100)
@@ -225,7 +244,9 @@ def main(args):
             socket_tx, 
             frame_queue, 
             queue_recv_timestamp, 
-            queue_preproc_timestamp
+            queue_preproc_timestamp,
+            compress,
+            gop
         )
     )
     thread_proc = Process(
@@ -247,16 +268,6 @@ def main(args):
             result_queue
         )
     )
-    
-
-    # Receive metadata
-    metadata = receive_data(socket_rx)
-    metadata = metadata.decode('utf-8')
-    metadata = eval(metadata)  # Convert string back to dictionary
-    frame_rate = metadata.get("frame_rate", 30)
-
-    print(f"Received metadata: {metadata}")
-    
 
     thread_recv.start()
     thread_proc.start()
@@ -329,8 +340,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Server for processing video frames.")
-    parser.add_argument("--server_ip", type=str, default="localhost", help="Server IP address.")
-    parser.add_argument("--server_port", type=int, default=65432, help="Server port.")
+    parser.add_argument("--server-ip", type=str, default="localhost", help="Server IP address.")
+    parser.add_argument("--server-port", type=int, default=65432, help="Server port.")
     parser.add_argument("--device", type=str, default="cuda", help="Device to run the model on (cpu or cuda).")
 
     args = parser.parse_args()

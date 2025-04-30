@@ -23,7 +23,7 @@ from networking import (
 from preprocessing import ndarray_to_bytes, bytes_to_ndarray, load_video
 
 
-def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float, sem_offload, queue_timestamp: Queue) -> float:
+def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float, sem_offload, queue_timestamp: Queue, compress: bool) -> float:
     """
     Thread function to send video frames to the server.
 
@@ -41,6 +41,12 @@ def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float,
         # Transmit frame idx
         fidx_bytes = fidx.to_bytes(4, 'big')
         transmit_data(socket, fidx_bytes)
+
+        # Optionally encode the frame
+        if compress:
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+            _, frame = cv2.imencode('.jpg', frame, encode_param)
+            frame = np.array(frame)
 
         # Encode the frame
         transmit_data(socket, ndarray_to_bytes(frame))
@@ -82,8 +88,9 @@ def main(args):
     server_port1 = args.server_port
     server_port2 = server_port1 + 1
     video_path = args.video_path
-    frame_rate = args.frame_rate
+    gop = args.frame_rate
     sequential = args.sequential
+    compress = args.compress
 
     # Connect to the server
     socket_rx, socket_tx = connect_dual_tcp(server_ip, (server_port1, server_port2), node_type="client")
@@ -112,15 +119,17 @@ def main(args):
         args=(
             socket_tx, 
             video_path, 
-            frame_rate, 
+            gop, 
             sem_offload, 
-            queue_transmit_timestamp
+            queue_transmit_timestamp,
+            compress
         )
     )
 
     # Send metadata
     metadata = {
-        "frame_rate": frame_rate,
+        "gop": gop,
+        "compress": compress,
     }
     metadata_bytes = str(metadata).encode('utf-8')
     transmit_data(socket_tx, metadata_bytes)
@@ -162,18 +171,16 @@ def main(args):
     print(f"Min latency: {np.min(latencies):.4f} seconds")
 
 
-
-
-
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Client for sending video to server.")
-    parser.add_argument("--server_ip", type=str, default="localhost", help="Server IP address.")
-    parser.add_argument("--server_port", type=int, default=65432, help="Server port.")
-    parser.add_argument("--video_path", type=str, default="input.mp4", help="Path to the video file.")
-    parser.add_argument("--frame_rate", type=float, default=30.0, help="Frame rate for sending video.")
+    parser.add_argument("--server-ip", type=str, default="localhost", help="Server IP address.")
+    parser.add_argument("--server-port", type=int, default=65432, help="Server port.")
+    parser.add_argument("--video-path", type=str, default="input.mp4", help="Path to the video file.")
+    parser.add_argument("--frame-rate", type=float, default=30, help="Frame rate for sending video.")
     parser.add_argument("--sequential", type=bool, default=True, help="Sender waits until the result of the previous frame is received.")
+    parser.add_argument("--compress", action="store_true", help="Compress video frames before sending.")
 
     args = parser.parse_args()
 
