@@ -176,3 +176,4 @@ cython_debug/
 *.mp4
 *.pkl
 data
+logs

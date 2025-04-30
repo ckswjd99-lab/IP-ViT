@@ -137,17 +137,24 @@ def main(args):
     thread_send.join()
     thread_recv.join()
 
-    # Close sockets
-    socket_rx.close()
-    socket_tx.close()
-
-    # Print the stats
+    # Send statistics
     transmit_times = []
     receive_times = []
     while not queue_transmit_timestamp.empty():
         transmit_times.append(queue_transmit_timestamp.get())
     while not queue_receive_timestamp.empty():
         receive_times.append(queue_receive_timestamp.get())
+    transmit_times = np.array(transmit_times)
+    receive_times = np.array(receive_times)
+
+    transmit_data(socket_tx, ndarray_to_bytes(transmit_times))
+    transmit_data(socket_tx, ndarray_to_bytes(receive_times))
+
+    # Close sockets
+    socket_rx.close()
+    socket_tx.close()
+
+    # Print the stats
 
     latencies = [receive - transmit for transmit, receive in zip(transmit_times, receive_times)]
     print(f"Average latency: {np.mean(latencies):.4f} seconds")

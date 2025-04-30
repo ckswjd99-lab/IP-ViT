@@ -29,7 +29,13 @@ from preprocessing import (
 )
 
 
-def thread_receive_video(socket_rx: socket.socket, socket_tx: socket.socket, frame_queue: Queue) -> float:
+def thread_receive_video(
+    socket_rx: socket.socket, 
+    socket_tx: socket.socket, 
+    frame_queue: Queue,
+    queue_recv_timestamp: Queue,
+    queue_preproc_timestamp: Queue,
+) -> float:
     
     """
     Thread function to receive video frames from the client and put them into a queue.
@@ -55,7 +61,7 @@ def thread_receive_video(socket_rx: socket.socket, socket_tx: socket.socket, fra
 
         fidx = int.from_bytes(data[:4], 'big')
         frame = bytes_to_ndarray(receive_data(socket_rx))
-        # print(f"Received {fidx} | frame: {frame.shape} | timestamp: {time.time()}")
+        queue_recv_timestamp.put(time.time())
 
         target_ndarray = cv2.resize(frame, frame_size)
 
@@ -79,6 +85,8 @@ def thread_receive_video(socket_rx: socket.socket, socket_tx: socket.socket, fra
         
         anchor_image_padded = target_padded_ndarray
 
+        queue_preproc_timestamp.put(time.time())
+
         # Put the frame into the queue
         frame_queue.put((fidx, refresh, target_ndarray, dirtiness_map.cpu().numpy()))
         
@@ -90,7 +98,8 @@ def thread_process_video(
     socket_tx: socket.socket, 
     frame_queue: Queue, 
     result_queue: Queue,
-    device: str='cuda'
+    queue_proc_timestamp: Queue,
+    device: str='cuda',
 ) -> float:
     """
     Thread function to process video frames received from the client and send results back.
@@ -146,13 +155,11 @@ def thread_process_video(
         # Statistics
         compute_rates.append(dirtiness_map.mean().item())
 
-        print(f"Processed {fidx} | boxes: {boxes.shape}, scores: {scores.shape}, labels: {labels.shape} | timestamp: {time.time()}")
+        timestamp = time.time()
+        print(f"Processed {fidx} | boxes: {boxes.shape}, scores: {scores.shape}, labels: {labels.shape} | timestamp: {timestamp}")
+        queue_proc_timestamp.put(timestamp)
 
-        # Convert results to bytes
-        # transmit_data(socket_tx, fidx.to_bytes(4, 'big'))
-        # transmit_data(socket_tx, ndarray_to_bytes(boxes))
-        # transmit_data(socket_tx, ndarray_to_bytes(scores))
-        # transmit_data(socket_tx, ndarray_to_bytes(labels))
+        # Send results back to the client
         result_queue.put((fidx, boxes, scores, labels))
 
         num_frames += 1
@@ -207,9 +214,39 @@ def main(args):
     frame_queue = Queue(maxsize=100)
     result_queue = Queue(maxsize=100)
 
-    thread_recv = Process(target=thread_receive_video, args=(socket_rx, socket_tx, frame_queue))
-    thread_proc = Process(target=thread_process_video, args=(socket_rx, socket_tx, frame_queue, result_queue, device))
-    thread_send = Process(target=thread_send_result, args=(socket_rx, socket_tx, result_queue))
+    queue_recv_timestamp = Queue(maxsize=100)
+    queue_preproc_timestamp = Queue(maxsize=100)
+    queue_proc_timestamp = Queue(maxsize=100)
+
+    thread_recv = Process(
+        target=thread_receive_video, 
+        args=(
+            socket_rx, 
+            socket_tx, 
+            frame_queue, 
+            queue_recv_timestamp, 
+            queue_preproc_timestamp
+        )
+    )
+    thread_proc = Process(
+        target=thread_process_video, 
+        args=(
+            socket_rx, 
+            socket_tx, 
+            frame_queue, 
+            result_queue, 
+            queue_proc_timestamp, 
+            device
+        )
+    )
+    thread_send = Process(
+        target=thread_send_result, 
+        args=(
+            socket_rx, 
+            socket_tx, 
+            result_queue
+        )
+    )
     
 
     # Receive metadata
@@ -229,6 +266,58 @@ def main(args):
     thread_recv.join()
     thread_proc.join()
     thread_send.join()
+
+    # Receive statistics
+    transmit_times = bytes_to_ndarray(receive_data(socket_rx)) + timelag
+    result_times = bytes_to_ndarray(receive_data(socket_rx)) + timelag
+
+    # Process statistics
+    receive_times = []
+    while not queue_recv_timestamp.empty():
+        receive_times.append(queue_recv_timestamp.get())
+    receive_times = np.array(receive_times)
+
+    preproc_times = []
+    while not queue_preproc_timestamp.empty():
+        preproc_times.append(queue_preproc_timestamp.get())
+    preproc_times = np.array(preproc_times)
+
+    proc_times = []
+    while not queue_proc_timestamp.empty():
+        proc_times.append(queue_proc_timestamp.get())
+    proc_times = np.array(proc_times)
+
+    ### avg total latency
+    latencies = [receive - transmit for transmit, receive in zip(transmit_times, result_times)]
+    print(f"Average latency: {np.mean(latencies):.4f} seconds")
+
+    ### avg transfer latency
+    transfer_latencies = [receive - transmit for transmit, receive in zip(transmit_times, receive_times)]
+    print(f"Average transfer latency: {np.mean(transfer_latencies):.4f} seconds")
+
+    ### avg preproc latency
+    preproc_latencies = [preproc - receive for preproc, receive in zip(preproc_times, receive_times)]
+    print(f"Average preproc latency: {np.mean(preproc_latencies):.4f} seconds")
+
+    ### avg proc latency
+    proc_latencies = [proc - preproc for proc, preproc in zip(proc_times, preproc_times)]
+    print(f"Average proc latency: {np.mean(proc_latencies):.4f} seconds")
+    
+    ### avg return latency
+    return_latencies = [receive - proc for receive, proc in zip(result_times, proc_times)]
+    print(f"Average return latency: {np.mean(return_latencies):.4f} seconds")
+
+    
+    # Save logs as CSV
+    ### Columns: frame_idx, send_time, receive_time, preproc_time, proc_time, return_time
+    log_text = "frame_idx, send_time, receive_time, preproc_time, proc_time, return_time\n"
+    for i in range(len(transmit_times)):
+        log_text += f"{i}, {transmit_times[i]:.6f}, {receive_times[i]:.6f}, {preproc_times[i]:.6f}, {proc_times[i]:.6f}, {result_times[i]:.6f}\n"
+
+    with open("logs/server_log.csv", "w") as f:
+        f.write(log_text)
+    print("Logs saved to server_log.csv")
+
 
     # Close sockets
     socket_rx.close()
