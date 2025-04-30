@@ -23,7 +23,14 @@ from networking import (
 from preprocessing import ndarray_to_bytes, bytes_to_ndarray, load_video
 
 
-def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float, sem_offload, queue_timestamp: Queue, compress: bool) -> float:
+def thread_send_video(
+    socket: socket.socket, 
+    video_path: str, 
+    frame_rate: float, 
+    sem_offload, 
+    queue_timestamp: Queue, 
+    compress: bool
+) -> float:
     """
     Thread function to send video frames to the server.
 
@@ -58,7 +65,11 @@ def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float,
     transmit_data(socket, b"", HEADER_TERMINATE)  # Send termination signal
 
 
-def thread_receive_results(socket: socket.socket, sem_offload, queue_timestamp: Queue) -> float:
+def thread_receive_results(
+    socket: socket.socket, 
+    sem_offload, 
+    queue_timestamp: Queue
+) -> float:
     """
     Thread function to receive results from the server.
 
@@ -93,7 +104,9 @@ def main(args):
     compress = args.compress
 
     # Connect to the server
-    socket_rx, socket_tx = connect_dual_tcp(server_ip, (server_port1, server_port2), node_type="client")
+    socket_rx, socket_tx = connect_dual_tcp(
+        server_ip, (server_port1, server_port2), node_type="client"
+    )
 
     timelag = measure_timelag(socket_rx, socket_tx, "client")
     print(f"Timelag: {timelag} seconds")

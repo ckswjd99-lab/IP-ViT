@@ -81,7 +81,9 @@ def thread_receive_video(
         else:
             # try image refinement
             # affine_matrix = estimate_affine_in_padded_anchor(anchor_image_padded, frame)
-            affine_matrix = estimate_affine_in_padded_anchor_fast(anchor_image_padded, target_ndarray)
+            affine_matrix = estimate_affine_in_padded_anchor_fast(
+                anchor_image_padded, target_ndarray
+            )
             target_padded_ndarray = apply_affine_and_pad(target_ndarray, affine_matrix)
             
             scaling_factor = np.linalg.norm(affine_matrix[:2, :2])
@@ -148,7 +150,9 @@ def thread_process_video(
         # Process the frame
         if refresh:
             target_padded_ndarray = get_padded_image(target_ndarray, input_size)
-            (boxes, labels, scores), cached_features_dict = model.forward_contexted(target_padded_ndarray)
+            (boxes, labels, scores), cached_features_dict = model.forward_contexted(
+                target_padded_ndarray
+            )
             dirtiness_map = torch.ones(1, 64, 64, 1)
         else:
             (boxes, labels, scores), cached_features_dict = model.forward_contexted(
@@ -214,7 +218,9 @@ def main(args):
     device = args.device
 
     # Connect to the client
-    socket_rx, socket_tx = connect_dual_tcp(server_ip, (server_port1, server_port2), node_type="server")
+    socket_rx, socket_tx = connect_dual_tcp(
+        server_ip, (server_port1, server_port2), node_type="server"
+    )
 
     timelag = measure_timelag(socket_rx, socket_tx, "server")
     print(f"Timelag: {timelag} seconds")
@@ -303,19 +309,27 @@ def main(args):
     print(f"Average latency: {np.mean(latencies):.4f} seconds")
 
     ### avg transfer latency
-    transfer_latencies = [receive - transmit for transmit, receive in zip(transmit_times, receive_times)]
+    transfer_latencies = [
+        receive - transmit for transmit, receive in zip(transmit_times, receive_times)
+    ]
     print(f"Average transfer latency: {np.mean(transfer_latencies):.4f} seconds")
 
     ### avg preproc latency
-    preproc_latencies = [preproc - receive for preproc, receive in zip(preproc_times, receive_times)]
+    preproc_latencies = [
+        preproc - receive for preproc, receive in zip(preproc_times, receive_times)
+    ]
     print(f"Average preproc latency: {np.mean(preproc_latencies):.4f} seconds")
 
     ### avg proc latency
-    proc_latencies = [proc - preproc for proc, preproc in zip(proc_times, preproc_times)]
+    proc_latencies = [
+        proc - preproc for proc, preproc in zip(proc_times, preproc_times)
+    ]
     print(f"Average proc latency: {np.mean(proc_latencies):.4f} seconds")
     
     ### avg return latency
-    return_latencies = [receive - proc for receive, proc in zip(result_times, proc_times)]
+    return_latencies = [
+        receive - proc for receive, proc in zip(result_times, proc_times)
+    ]
     print(f"Average return latency: {np.mean(return_latencies):.4f} seconds")
 
     
