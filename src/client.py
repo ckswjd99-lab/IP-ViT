@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 import socket
 import time
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Semaphore
 
 from typing import List, Tuple
 
@@ -23,7 +23,7 @@ from networking import (
 from preprocessing import ndarray_to_bytes, bytes_to_ndarray, load_video
 
 
-def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float=30) -> float:
+def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float, sem_offload, queue_timestamp: Queue) -> float:
     """
     Thread function to send video frames to the server.
 
@@ -34,8 +34,10 @@ def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float=
     """
     frames = load_video(video_path)
 
-    start_timestamp = time.time()
     for fidx, frame in enumerate(frames):
+        if sem_offload is not None:
+            sem_offload.acquire()  # Wait for server to process the frame
+
         # Transmit frame idx
         fidx_bytes = fidx.to_bytes(4, 'big')
         transmit_data(socket, fidx_bytes)
@@ -43,15 +45,14 @@ def thread_send_video(socket: socket.socket, video_path: str, frame_rate: float=
         # Encode the frame
         transmit_data(socket, ndarray_to_bytes(frame))
 
-        print(f"Transferred {fidx} | frame: {frame.shape} | timestamp: {time.time()}")
+        timestamp = time.time()
+        print(f"Transferred {fidx} | frame: {frame.shape} | timestamp: {timestamp}")
+        queue_timestamp.put(timestamp)
 
     transmit_data(socket, b"", HEADER_TERMINATE)  # Send termination signal
-    end_timestamp = time.time()
-
-    return end_timestamp - start_timestamp
 
 
-def thread_receive_results(socket: socket.socket) -> float:
+def thread_receive_results(socket: socket.socket, sem_offload, queue_timestamp: Queue) -> float:
     """
     Thread function to receive results from the server.
 
@@ -68,7 +69,12 @@ def thread_receive_results(socket: socket.socket) -> float:
         scores = bytes_to_ndarray(receive_data(socket))
         labels = bytes_to_ndarray(receive_data(socket))
 
-        print(f"Received {fidx} | boxes: {boxes.shape}, scores: {scores.shape}, labels: {labels.shape} | timestamp: {time.time()}")
+        timestamp = time.time()
+        print(f"Received {fidx} | boxes: {boxes.shape}, scores: {scores.shape}, labels: {labels.shape} | timestamp: {timestamp}")
+        queue_timestamp.put(timestamp)
+
+        if sem_offload is not None:
+            sem_offload.release()  # Release semaphore to indicate processing is done
         
 
 def main(args):
@@ -77,6 +83,7 @@ def main(args):
     server_port2 = server_port1 + 1
     video_path = args.video_path
     frame_rate = args.frame_rate
+    sequential = args.sequential
 
     # Connect to the server
     socket_rx, socket_tx = connect_dual_tcp(server_ip, (server_port1, server_port2), node_type="client")
@@ -84,10 +91,32 @@ def main(args):
     timelag = measure_timelag(socket_rx, socket_tx, "client")
     print(f"Timelag: {timelag} seconds")
 
-    # Prepare processes
-    thread_recv = Process(target=thread_receive_results, args=(socket_rx,))
-    thread_send = Process(target=thread_send_video, args=(socket_tx, video_path, frame_rate))
+    # Create queues for recording
+    queue_transmit_timestamp = Queue(maxsize=100)
+    queue_receive_timestamp = Queue(maxsize=100)
 
+    # Create a semaphore for offloading
+    sem_offload = Semaphore(1) if sequential else None
+
+    # Prepare processes
+    thread_recv = Process(
+        target=thread_receive_results, 
+        args=(
+            socket_rx, 
+            sem_offload, 
+            queue_receive_timestamp
+        )
+    )
+    thread_send = Process(
+        target=thread_send_video, 
+        args=(
+            socket_tx, 
+            video_path, 
+            frame_rate, 
+            sem_offload, 
+            queue_transmit_timestamp
+        )
+    )
 
     # Send metadata
     metadata = {
@@ -112,6 +141,19 @@ def main(args):
     socket_rx.close()
     socket_tx.close()
 
+    # Print the stats
+    transmit_times = []
+    receive_times = []
+    while not queue_transmit_timestamp.empty():
+        transmit_times.append(queue_transmit_timestamp.get())
+    while not queue_receive_timestamp.empty():
+        receive_times.append(queue_receive_timestamp.get())
+
+    latencies = [receive - transmit for transmit, receive in zip(transmit_times, receive_times)]
+    print(f"Average latency: {np.mean(latencies):.4f} seconds")
+    print(f"Max latency: {np.max(latencies):.4f} seconds")
+    print(f"Min latency: {np.min(latencies):.4f} seconds")
+
 
 
 
@@ -124,6 +166,7 @@ if __name__ == "__main__":
     parser.add_argument("--server_port", type=int, default=65432, help="Server port.")
     parser.add_argument("--video_path", type=str, default="input.mp4", help="Path to the video file.")
     parser.add_argument("--frame_rate", type=float, default=30.0, help="Frame rate for sending video.")
+    parser.add_argument("--sequential", type=bool, default=True, help="Sender waits until the result of the previous frame is received.")
 
     args = parser.parse_args()
 
