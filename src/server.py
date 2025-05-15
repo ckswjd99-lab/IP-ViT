@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import socket
 import time
+import av
 from multiprocessing import Process, Queue
 
 
@@ -31,11 +32,11 @@ from preprocessing import (
 
 def thread_receive_video(
     socket_rx: socket.socket, 
-    socket_tx: socket.socket, 
     frame_queue: Queue,
+    frame_shape: Tuple[int, int],
     queue_recv_timestamp: Queue,
     queue_preproc_timestamp: Queue,
-    compress: bool,
+    compress: str,
     gop: int,
 ) -> float:
     
@@ -44,33 +45,46 @@ def thread_receive_video(
 
     Args:
         socket_rx (socket.socket): The socket object to receive data from.
-        socket_tx (socket.socket): The socket object to send data to.
         frame_queue (Queue): Queue to store received frames.
+        queue_recv_timestamp (Queue): Queue to store receive timestamps.
+        queue_preproc_timestamp (Queue): Queue to store preprocessing timestamps.
+        compress (str): Compression method to use ('jpeg', 'h264', or 'none').
+        gop (int): Group of pictures size for video encoding.
     """
     import torch
 
     input_size = (1024, 1024)
-    frame_size = (854, 480)
 
     anchor_image_padded = None
 
+    if compress == "h264":
+        codec = av.codec.CodecContext.create('h264', 'r')
+    
     while True:
-        # Receive frame
+        # Receive frame idx
         data = receive_data(socket_rx)
         if data is None:
             break
 
         fidx = int.from_bytes(data[:4], 'big')
+        print(f"Received {fidx} | timestamp: {time.time()}")
 
         # Optionally decode the frame
-        if compress:
+        if compress == "jpeg":
             data = bytes_to_ndarray(receive_data(socket_rx))
             frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        
+        elif compress == "h264":
+            data = receive_data(socket_rx)
+            packet = av.Packet(data)
+            frames = codec.decode(packet)
+            frame = frames[0].to_ndarray(format='bgr24')
+            
         else:
             frame = bytes_to_ndarray(receive_data(socket_rx))
         queue_recv_timestamp.put(time.time())
 
-        target_ndarray = cv2.resize(frame, frame_size)
+        target_ndarray = cv2.resize(frame, frame_shape)
 
         # Preprocess the frame
         refresh = False
@@ -105,7 +119,6 @@ def thread_receive_video(
     
 
 def thread_process_video(
-    socket_rx: socket.socket, 
     socket_tx: socket.socket, 
     frame_queue: Queue, 
     result_queue: Queue,
@@ -231,7 +244,8 @@ def main(args):
     metadata = eval(metadata)  # Convert string back to dictionary
     
     gop = metadata.get("gop", 30)
-    compress = metadata.get("compress", False)
+    compress = metadata.get("compress", "none")
+    frame_shape = metadata.get("frame_shape", (854, 480))
 
     print(f"Received metadata: {metadata}")
 
@@ -247,18 +261,17 @@ def main(args):
         target=thread_receive_video, 
         args=(
             socket_rx, 
-            socket_tx, 
-            frame_queue, 
+            frame_queue,
+            frame_shape,
             queue_recv_timestamp, 
             queue_preproc_timestamp,
             compress,
-            gop
+            gop,
         )
     )
     thread_proc = Process(
         target=thread_process_video, 
         args=(
-            socket_rx, 
             socket_tx, 
             frame_queue, 
             result_queue, 
@@ -312,25 +325,25 @@ def main(args):
     transfer_latencies = [
         receive - transmit for transmit, receive in zip(transmit_times, receive_times)
     ]
-    print(f"Average transfer latency: {np.mean(transfer_latencies):.4f} seconds")
+    print(f" > Average transfer latency: {np.mean(transfer_latencies):.4f} seconds")
 
     ### avg preproc latency
     preproc_latencies = [
         preproc - receive for preproc, receive in zip(preproc_times, receive_times)
     ]
-    print(f"Average preproc latency: {np.mean(preproc_latencies):.4f} seconds")
+    print(f" > Average preproc latency: {np.mean(preproc_latencies):.4f} seconds")
 
     ### avg proc latency
     proc_latencies = [
         proc - preproc for proc, preproc in zip(proc_times, preproc_times)
     ]
-    print(f"Average proc latency: {np.mean(proc_latencies):.4f} seconds")
+    print(f" > Average proc latency: {np.mean(proc_latencies):.4f} seconds")
     
     ### avg return latency
     return_latencies = [
         receive - proc for receive, proc in zip(result_times, proc_times)
     ]
-    print(f"Average return latency: {np.mean(return_latencies):.4f} seconds")
+    print(f" > Average return latency: {np.mean(return_latencies):.4f} seconds")
 
     
     # Save logs as CSV

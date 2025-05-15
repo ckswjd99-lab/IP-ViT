@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import socket
 import time
+import av
 from multiprocessing import Process, Queue, Semaphore
 
 from typing import List, Tuple
@@ -24,12 +25,12 @@ from preprocessing import ndarray_to_bytes, bytes_to_ndarray, load_video
 
 
 def thread_send_video(
-    socket: socket.socket, 
+    socket_tx: socket.socket, 
     video_path: str, 
     frame_rate: float, 
     sem_offload, 
     queue_timestamp: Queue, 
-    compress: bool
+    compress: str,
 ) -> float:
     """
     Thread function to send video frames to the server.
@@ -38,31 +39,59 @@ def thread_send_video(
         socket (socket.socket): The socket object to send data over.
         video_path (str): Path to the video file.
         frame_rate (float): Frame rate for sending video frames.
+        sem_offload (Semaphore): Semaphore for sequential offloading.
+        queue_timestamp (Queue): Queue to store timestamps.
+        compress (str): Compression method to use ('jpeg', 'h264', or 'none').
     """
     frames = load_video(video_path)
 
+    WIDTH, HEIGHT = frames[0].shape[1], frames[0].shape[0]
+
+    if compress == "h264":
+        codec = av.codec.CodecContext.create('libx264', 'w')
+        codec.width = WIDTH
+        codec.height = HEIGHT
+        codec.pix_fmt = 'yuv420p'
+        codec.time_base = av.time_base
+        codec.options = {'preset': 'ultrafast', 'tune': 'zerolatency'}
+        codec.open()
+
+    # Wait for server to be ready
     for fidx, frame in enumerate(frames):
         if sem_offload is not None:
             sem_offload.acquire()  # Wait for server to process the frame
 
         # Transmit frame idx
         fidx_bytes = fidx.to_bytes(4, 'big')
-        transmit_data(socket, fidx_bytes)
+        transmit_data(socket_tx, fidx_bytes)
+
+        timestamp = time.time()
 
         # Optionally encode the frame
-        if compress:
+        if compress == "jpeg":
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
             _, frame = cv2.imencode('.jpg', frame, encode_param)
             frame = np.array(frame)
+            frame_bytes = ndarray_to_bytes(frame)
+        
+        elif compress == "h264":
+            vframe = av.VideoFrame.from_ndarray(frame, format='bgr24')
+            frame_bytes = b''
+            for packet in codec.encode(vframe):
+                frame_bytes += bytes(packet)
+        
+        else:
+            frame_bytes = ndarray_to_bytes(frame)
 
-        # Encode the frame
-        transmit_data(socket, ndarray_to_bytes(frame))
+        # Transmit the frame
+        transmit_data(socket_tx, frame_bytes)
 
-        timestamp = time.time()
+        # Logging
         print(f"Transferred {fidx} | frame: {frame.shape} | timestamp: {timestamp}")
         queue_timestamp.put(timestamp)
 
-    transmit_data(socket, b"", HEADER_TERMINATE)  # Send termination signal
+    # Send termination signal
+    transmit_data(socket_tx, b"", HEADER_TERMINATE)
 
 
 def thread_receive_results(
@@ -143,13 +172,15 @@ def main(args):
     metadata = {
         "gop": gop,
         "compress": compress,
+        "frame_shape": (854, 480)
     }
     metadata_bytes = str(metadata).encode('utf-8')
     transmit_data(socket_tx, metadata_bytes)
 
     print("Sent metadata:", metadata)
 
-    receive_data(socket_rx)  # Wait for server to be ready
+    # Wait for server to be ready
+    receive_data(socket_rx)
 
     # Start sending video
     thread_recv.start()
@@ -193,7 +224,7 @@ if __name__ == "__main__":
     parser.add_argument("--video-path", type=str, default="input.mp4", help="Path to the video file.")
     parser.add_argument("--frame-rate", type=float, default=30, help="Frame rate for sending video.")
     parser.add_argument("--sequential", type=bool, default=True, help="Sender waits until the result of the previous frame is received.")
-    parser.add_argument("--compress", action="store_true", help="Compress video frames before sending.")
+    parser.add_argument("--compress", type=str, default="none", help="Compress video frames before sending.")
 
     args = parser.parse_args()
 
