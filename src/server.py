@@ -30,6 +30,23 @@ from preprocessing import (
 )
 
 
+def rigid_from_mvs(mvs: np.ndarray):
+    """
+    모션벡터 → 현재 프레임 ➜ 참조(이전) 프레임으로 가는 2×3 rigid 변환 추정.
+    실패 시 None 반환.
+    """
+    if mvs.shape[0] < 3:
+        return None
+    dst = mvs[:, 5:7].astype(np.float32)                       # 현재 블록 중심
+    src = dst + (mvs[:, 7:9] / mvs[:, 9:10]).astype(np.float32)  # 참조 쪽 좌표
+    M, _ = cv2.estimateAffinePartial2D(dst, src,
+                                       method=cv2.RANSAC,
+                                       ransacReprojThreshold=2.0,
+                                       confidence=0.995,
+                                       refineIters=10)
+    return M                                                   # shape (2,3) or None
+
+
 def thread_receive_video(
     socket_rx: socket.socket, 
     frame_queue: Queue,
@@ -55,7 +72,16 @@ def thread_receive_video(
 
     input_size = (1024, 1024)
 
+    # Buffers for h264
+    fw, fh = frame_shape
+    center_vec = np.array([input_size[1]/2 - fw/2,
+                input_size[0]/2 - fh/2], dtype=np.float32)
+    prev_H = np.array([[1,0,center_vec[0]],
+                      [0,1,center_vec[1]],
+                      [0,0,1]], dtype=np.float32)
+
     anchor_image_padded = None
+
 
     if compress == "h264":
         codec = av.codec.CodecContext.create('h264', 'r')
@@ -79,6 +105,9 @@ def thread_receive_video(
             packet = av.Packet(data)
             frames = codec.decode(packet)
             frame = frames[0].to_ndarray(format='bgr24')
+
+            # receive motion vectors
+            mvs = bytes_to_ndarray(receive_data(socket_rx))
             
         else:
             frame = bytes_to_ndarray(receive_data(socket_rx))
@@ -94,14 +123,38 @@ def thread_receive_video(
             target_padded_ndarray = get_padded_image(target_ndarray, input_size)
         else:
             # try image refinement
-            # affine_matrix = estimate_affine_in_padded_anchor(anchor_image_padded, frame)
-            affine_matrix = estimate_affine_in_padded_anchor_fast(
-                anchor_image_padded, target_ndarray
-            )
-            target_padded_ndarray = apply_affine_and_pad(target_ndarray, affine_matrix)
+            if compress == "h264":
+                # get the affine matrix and accumulate to the previous one
+                M_cur_prev = rigid_from_mvs(mvs)
+                if M_cur_prev is not None:
+                    H_cur_prev = np.vstack([M_cur_prev, [0,0,1]])
+                    cum_H = prev_H @ H_cur_prev
+                else:
+                    cum_H = np.array([[1,0,center_vec[0]],
+                                      [0,1,center_vec[1]],
+                                      [0,0,1]], dtype=np.float32)
+                prev_H = cum_H.copy()
+                affine_matrix = cum_H[:2, :].copy()
+            else:
+                # affine_matrix = estimate_affine_in_padded_anchor(anchor_image_padded, frame)
+                affine_matrix = estimate_affine_in_padded_anchor_fast(
+                    anchor_image_padded, target_ndarray
+                )
             
-            scaling_factor = np.linalg.norm(affine_matrix[:2, :2])
-            dirtiness_map = create_dirtiness_map(anchor_image_padded, target_padded_ndarray)
+            target_padded_ndarray = apply_affine_and_pad(target_ndarray, affine_matrix)
+                
+            if target_padded_ndarray is not None:
+                scaling_factor = np.linalg.norm(affine_matrix[:2, :2])
+                dirtiness_map = create_dirtiness_map(anchor_image_padded, target_padded_ndarray)
+            else:
+                print("Affine estimation failed, using default dirtiness map.")
+                target_padded_ndarray = get_padded_image(target_ndarray, input_size)
+                dirtiness_map = torch.ones(1, 64, 64, 1)
+                scaling_factor = 1.0
+
+                prev_H = np.array([[1,0,center_vec[0]],
+                                  [0,1,center_vec[1]],
+                                  [0,0,1]], dtype=np.float32)
             
             refresh |= (target_padded_ndarray is None)
             refresh |= (scaling_factor < 0.95)

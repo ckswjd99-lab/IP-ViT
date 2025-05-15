@@ -56,6 +56,15 @@ def thread_send_video(
         codec.options = {'preset': 'ultrafast', 'tune': 'zerolatency'}
         codec.open()
 
+        # at the same directory as the video, get <05d>.npy files
+        motion_vectors = []
+        for i in range(len(frames)):
+            base_name = video_path.split("/")[-1].split(".")[0]
+            base_path = video_path.split(base_name)[0]
+            mv_path = f"{base_path}/{i:05d}.npy"
+            mv = np.load(mv_path)
+            motion_vectors.append(mv)
+
     # Wait for server to be ready
     for fidx, frame in enumerate(frames):
         if sem_offload is not None:
@@ -85,6 +94,12 @@ def thread_send_video(
 
         # Transmit the frame
         transmit_data(socket_tx, frame_bytes)
+
+        # Transmit motion vectors if using h264
+        if compress == "h264":
+            mv = motion_vectors[fidx]
+            mv_bytes = ndarray_to_bytes(mv)
+            transmit_data(socket_tx, mv_bytes)
 
         # Logging
         print(f"Transferred {fidx} | frame: {frame.shape} | timestamp: {timestamp}")
@@ -221,7 +236,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Client for sending video to server.")
     parser.add_argument("--server-ip", type=str, default="localhost", help="Server IP address.")
     parser.add_argument("--server-port", type=int, default=65432, help="Server port.")
-    parser.add_argument("--video-path", type=str, default="input.mp4", help="Path to the video file.")
+    parser.add_argument("--video-path", type=str, default="./bear_prep/video-ip.mp4", help="Path to the video file.")
     parser.add_argument("--frame-rate", type=float, default=30, help="Frame rate for sending video.")
     parser.add_argument("--sequential", type=bool, default=True, help="Sender waits until the result of the previous frame is received.")
     parser.add_argument("--compress", type=str, default="none", help="Compress video frames before sending.")
