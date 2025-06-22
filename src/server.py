@@ -133,7 +133,6 @@ def thread_receive_video(
         queue_recv_timestamp.put(recv_timestamp)
 
         target_ndarray = cv2.resize(frame, frame_shape)
-        cv2.imwrite(f"recv/{fidx:05d}.jpg", target_ndarray)
 
         # Preprocess the frame
         refresh = False
@@ -175,10 +174,6 @@ def thread_receive_video(
                 ])
                 anchor_image_padded = anchor_image_padded.copy()
                 anchor_image_padded = np.roll(anchor_image_padded, shift=(-shift_x, -shift_y), axis=(1, 0))
-
-                # save anchor and target images
-                cv2.imwrite(f"anchor/{fidx:05d}.jpg", anchor_image_padded)
-                cv2.imwrite(f"target/{fidx:05d}.jpg", target_padded_ndarray)
                 
                 if target_padded_ndarray is not None:
                     scaling_factor = np.linalg.norm(affine_matrix[:2, :2])
@@ -402,6 +397,8 @@ def main(args):
     server_port2 = server_port1 + 1
     device = args.device
 
+    os.makedirs("inferenced", exist_ok=True)
+
     # Connect to the client
     socket_rx, socket_tx = connect_dual_tcp(
         server_ip, (server_port1, server_port2), node_type="server"
@@ -535,6 +532,7 @@ def main(args):
 
     # Create inferenced video using ffmpeg
     os.system("ffmpeg -framerate 30 -i inferenced/%05d.jpg -c:v libx264 -pix_fmt yuv420p -an -y inferenced.mp4 2> /dev/null")
+    os.system("rm -rf inferenced")  # Clean up images
 
 
 if __name__ == "__main__":
