@@ -12,6 +12,7 @@ import numpy as np
 import socket
 import time
 import av
+import sys
 from multiprocessing import Process, Queue, Semaphore
 
 from typing import List, Tuple
@@ -22,6 +23,8 @@ from networking import (
     measure_timelag,
 )
 from preprocessing import ndarray_to_bytes, bytes_to_ndarray, load_video
+
+from custom_h264 import custom_h264
 
 
 def thread_send_video(
@@ -44,28 +47,11 @@ def thread_send_video(
         compress (str): Compression method to use ('jpeg', 'h264', or 'none').
     """
     frames = load_video(video_path)
-
     WIDTH, HEIGHT = frames[0].shape[1], frames[0].shape[0]
 
     if compress == "h264":
-        codec = av.codec.CodecContext.create('libx264', 'w')
-        codec.width = WIDTH
-        codec.height = HEIGHT
-        codec.pix_fmt = 'yuv420p'
-        codec.time_base = av.time_base
-        codec.options = {'preset': 'ultrafast', 'tune': 'zerolatency'}
-        codec.open()
+        custom_h264.mv_init(WIDTH, HEIGHT, int(frame_rate))
 
-        # at the same directory as the video, get <05d>.npy files
-        motion_vectors = []
-        for i in range(len(frames)):
-            base_name = video_path.split("/")[-1].split(".")[0]
-            base_path = video_path.split(base_name)[0]
-            mv_path = f"{base_path}/{i:05d}.npy"
-            mv = np.load(mv_path)
-            motion_vectors.append(mv)
-
-    # Wait for server to be ready
     for fidx, frame in enumerate(frames):
         if sem_offload is not None:
             sem_offload.acquire()  # Wait for server to process the frame
@@ -79,31 +65,30 @@ def thread_send_video(
         # Optionally encode the frame
         if compress == "jpeg":
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
-            _, frame = cv2.imencode('.jpg', frame, encode_param)
-            frame = np.array(frame)
-            frame_bytes = ndarray_to_bytes(frame)
+            _, frame_enc = cv2.imencode('.jpg', frame, encode_param)
+            frame_enc = np.array(frame_enc)
+            frame_bytes = ndarray_to_bytes(frame_enc)
+            transmit_data(socket_tx, frame_bytes)
         
         elif compress == "h264":
-            vframe = av.VideoFrame.from_ndarray(frame, format='bgr24')
-            frame_bytes = b''
-            for packet in codec.encode(vframe):
-                frame_bytes += bytes(packet)
+            # mv_lib로 인코딩 및 모션벡터 추출
+            encoded_bytes, mv = custom_h264.mv_process_and_encode(frame)
+            # 인코딩 바이트 전송 (길이 포함)
+            transmit_data(socket_tx, encoded_bytes)
+            # 모션벡터 전송
+            mv_bytes = ndarray_to_bytes(mv)
+            transmit_data(socket_tx, mv_bytes)
         
         else:
             frame_bytes = ndarray_to_bytes(frame)
-
-        # Transmit the frame
-        transmit_data(socket_tx, frame_bytes)
-
-        # Transmit motion vectors if using h264
-        if compress == "h264":
-            mv = motion_vectors[fidx]
-            mv_bytes = ndarray_to_bytes(mv)
-            transmit_data(socket_tx, mv_bytes)
+            transmit_data(socket_tx, frame_bytes)
 
         # Logging
         print(f"Transferred {fidx} | frame: {frame.shape} | timestamp: {timestamp}")
         queue_timestamp.put(timestamp)
+
+    if compress == "h264":
+        custom_h264.mv_close()
 
     # Send termination signal
     transmit_data(socket_tx, b"", HEADER_TERMINATE)
@@ -236,7 +221,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Client for sending video to server.")
     parser.add_argument("--server-ip", type=str, default="localhost", help="Server IP address.")
     parser.add_argument("--server-port", type=int, default=65432, help="Server port.")
-    parser.add_argument("--video-path", type=str, default="./bear_prep/video-ip.mp4", help="Path to the video file.")
+    parser.add_argument("--video-path", type=str, default="./input.mp4", help="Path to the video file.")
     parser.add_argument("--frame-rate", type=float, default=30, help="Frame rate for sending video.")
     parser.add_argument("--sequential", type=bool, default=True, help="Sender waits until the result of the previous frame is received.")
     parser.add_argument("--compress", type=str, default="none", help="Compress video frames before sending.")

@@ -2,8 +2,9 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+import math
 
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 
 def create_sensitivity_map(
@@ -50,7 +51,7 @@ def create_dirtiness_map(
     anchor_image: np.ndarray, 
     current_image: np.ndarray,
     block_size: int = 16,
-    dirty_thres: int = 30,
+    dirty_thres: int = 20,
     chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8),
     sensi_map: np.ndarray = None,
 ) -> torch.Tensor:
@@ -78,13 +79,13 @@ def create_dirtiness_map(
     dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
 
     # minimum recompute
-    maxnum = 10
-    while dirtiness_map.mean() < 0.1:
-        dirtiness_map = expand_mask_neighbors(dirtiness_map)
+    # maxnum = 10
+    # while dirtiness_map.mean() < 0.01:
+    #     dirtiness_map = expand_mask_neighbors(dirtiness_map)
 
-        maxnum -= 1
-        if maxnum == 0:
-            break
+    #     maxnum -= 1
+    #     if maxnum == 0:
+    #         break
 
     return dirtiness_map
 
@@ -196,27 +197,71 @@ def pattern_match_in_padded_anchor(
     translation_matrix = np.float32([[1, 0, translation_vector[0]], [0, 1, translation_vector[1]]])
 
     return translation_matrix
+
+def shift_anchor_features(anchor_features: dict, shift_x: int, shift_y: int):
+    """
+    anchor_features의 모든 qkv/out 텐서를 shift_x, shift_y만큼 블록 단위로 이동시킴.
+    """
+    for key, value in anchor_features.items():
+        if "qkv" in key:
+            num_windows = value.shape[1]
+            num_hw = value.shape[3]
+
+            sqrt_num_windows = int(math.sqrt(num_windows))
+            sqrt_num_hw = int(math.sqrt(num_hw))
+
+            key_reshaped = value.view(
+                value.shape[0], sqrt_num_windows, sqrt_num_windows, value.shape[2],
+                sqrt_num_hw, sqrt_num_hw, value.shape[4]
+            )
+            key_reshaped = key_reshaped.permute(0, 1, 4, 2, 5, 3, 6).contiguous().view(
+                value.shape[0], sqrt_num_windows * sqrt_num_hw, sqrt_num_windows * sqrt_num_hw, value.shape[2], value.shape[4]
+            )
+            key_reshaped = key_reshaped.roll(shifts=(-shift_y, -shift_x), dims=(1, 2))
+            key_reshaped = key_reshaped.view(
+                value.shape[0], sqrt_num_windows, sqrt_num_hw, sqrt_num_windows, sqrt_num_hw, value.shape[2], value.shape[4]
+            )
+            key_reshaped = key_reshaped.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
+            key_reshaped = key_reshaped.view(*value.shape)
+            anchor_features[key] = key_reshaped
+        if "out" in key:
+            # value: (B, H, W, C)
+            value = value.roll(shifts=(-shift_y, -shift_x), dims=(1, 2))
+            anchor_features[key] = value
     
+    return anchor_features
+
 def apply_affine_and_pad(
     target_ndarray: np.ndarray,  # (H, W, 3)
     affine_matrix: np.ndarray,  # (2, 3)
+    block_size: int = 16,
+    filling_color: list = [123.675, 116.28, 103.53]
 ) -> np.ndarray | None:
     result_image = np.zeros((1024, 1024, 3), dtype=np.uint8)
     H, W = target_ndarray.shape[:2]
 
+    points = np.array([[0, 0], [0, H], [W, 0], [W, H]], dtype=np.float32).reshape(-1, 1, 2)
+    transformed_points = cv2.transform(points, affine_matrix)
+
+    shift_x, shift_y = 0, 0
+    if np.any(transformed_points < 0) or np.any(transformed_points > 1024):
+        shift_x_minus = math.floor(min(0, transformed_points[:, 0, 0].min() / block_size))
+        shift_x_plus = math.ceil(max(0, (transformed_points[:, 0, 0].max() - 1024) / block_size))
+        shift_y_minus = math.floor(min(0, transformed_points[:, 0, 1].min() / block_size))
+        shift_y_plus = math.ceil(max(0, (transformed_points[:, 0, 1].max() - 1024) / block_size))
+        shift_x = int(shift_x_minus + shift_x_plus)
+        shift_y = int(shift_y_minus + shift_y_plus)
+
+        affine_matrix[0, 2] -= shift_x * block_size
+        affine_matrix[1, 2] -= shift_y * block_size
+
     transformed_target = cv2.warpAffine(target_ndarray, affine_matrix, (1024, 1024))
     mask = transformed_target != 0
 
-    # Check if any part of the transformed image is outside the 1024x1024 bounds
-    points = np.array([[0, 0], [0, H], [W, 0], [W, H]], dtype=np.float32).reshape(-1, 1, 2)
-    transformed_points = cv2.transform(points, affine_matrix)
-    if np.any(transformed_points < 0) or np.any(transformed_points > 1024):
-        return None
-
-    result_image[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
+    result_image[:, :] = np.array(filling_color, dtype=np.uint8)
     result_image[mask] = transformed_target[mask]
 
-    return result_image
+    return result_image, (shift_x * block_size, shift_y * block_size), affine_matrix
 
 def affine_ground_truth_boxes(
     boxes_gt: List[List[float]],  # List of bounding boxes, each box is in a format of [x_min, y_min, x_max, y_max]
@@ -245,14 +290,15 @@ def affine_ground_truth_boxes(
 def get_padded_image(
     image_ndarray: np.ndarray, 
     size: Tuple[int, int], 
-    basic_scaling_factor: float = 1.0
+    basic_scaling_factor: float = 1.0,
+    filling_color: List[float] = [123.675, 116.28, 103.53]
 ) -> np.ndarray:
     image_scaled = cv2.resize(image_ndarray, (int(image_ndarray.shape[1] * basic_scaling_factor), int(image_ndarray.shape[0] * basic_scaling_factor)), interpolation=cv2.INTER_LINEAR)
 
     shift_to_center = ((size[1] - image_scaled.shape[1]) // 2, (size[0] - image_scaled.shape[0]) // 2)
 
     padded_image = np.zeros((size[0], size[1], 3), dtype=np.uint8)
-    padded_image[:, :] = np.array([123.675, 116.28, 103.53], dtype=np.uint8)
+    padded_image[:, :] = np.array(filling_color, dtype=np.uint8)
     padded_image[shift_to_center[1]:shift_to_center[1] + image_scaled.shape[0], shift_to_center[0]:shift_to_center[0] + image_scaled.shape[1]] = image_scaled
 
     return padded_image

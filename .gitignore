@@ -177,3 +177,7 @@ cython_debug/
 *.pkl
 data
 logs
+.vscode
+*.jpg
+*.pth
+*.pkl
