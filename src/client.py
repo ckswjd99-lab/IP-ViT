@@ -27,6 +27,26 @@ from preprocessing import ndarray_to_bytes, bytes_to_ndarray, load_video
 from custom_h264 import custom_h264
 
 
+def rigid_from_mvs(mvs: np.ndarray):
+    """
+    모션벡터(N, 5) → 현재 프레임 ➜ 참조(이전) 프레임으로 가는 2×3 rigid 변환 추정.
+    실패 시 None 반환.
+    """
+    if mvs is None or mvs.shape[0] < 3 or mvs.shape[1] != 5:
+        return None
+    # mvs: [dst_x, dst_y, motion_x, motion_y, motion_scale]
+    dst = mvs[:, 0:2].astype(np.float32)
+    src = dst + (mvs[:, 2:4] / mvs[:, 4:5]).astype(np.float32)
+    if dst.shape[0] < 3 or src.shape[0] < 3:
+        return None
+    M, _ = cv2.estimateAffinePartial2D(dst, src,
+                                       method=cv2.RANSAC,
+                                       ransacReprojThreshold=2.0,
+                                       confidence=0.995,
+                                       refineIters=10)
+    return M                                                   # shape (2,3) or None
+
+
 def thread_send_video(
     socket_tx: socket.socket, 
     video_path: str, 
@@ -50,7 +70,8 @@ def thread_send_video(
     WIDTH, HEIGHT = frames[0].shape[1], frames[0].shape[0]
 
     if compress == "h264":
-        custom_h264.mv_init(WIDTH, HEIGHT, int(frame_rate))
+        X264_PARAMS = "keyint=9999:min-keyint=9999:no-scenecut=1:bframes=0:ref=1:deadzone-inter=1000:deadzone-intra=300:aq-mode=0:psy-rd=0.0:mbtree=0:rc-lookahead=0:qpstep=10"
+        custom_h264.mv_init(WIDTH, HEIGHT, int(frame_rate), X264_PARAMS)
 
     for fidx, frame in enumerate(frames):
         if sem_offload is not None:
@@ -72,11 +93,15 @@ def thread_send_video(
         
         elif compress == "h264":
             # mv_lib로 인코딩 및 모션벡터 추출
-            encoded_bytes, mv = custom_h264.mv_process_and_encode(frame)
+            encoded_bytes, mvs = custom_h264.mv_process_and_encode(frame)
             # 인코딩 바이트 전송 (길이 포함)
             transmit_data(socket_tx, encoded_bytes)
             # 모션벡터 전송
-            mv_bytes = ndarray_to_bytes(mv)
+            M_cur_prev = rigid_from_mvs(mvs)
+            if M_cur_prev is None:
+                M_cur_prev = -np.ones((2, 3), dtype=np.float32)  # Fallback to identity if estimation fails
+
+            mv_bytes = ndarray_to_bytes(M_cur_prev)
             transmit_data(socket_tx, mv_bytes)
         
         else:
@@ -222,9 +247,9 @@ if __name__ == "__main__":
     parser.add_argument("--server-ip", type=str, default="localhost", help="Server IP address.")
     parser.add_argument("--server-port", type=int, default=65432, help="Server port.")
     parser.add_argument("--video-path", type=str, default="./input.mp4", help="Path to the video file.")
-    parser.add_argument("--frame-rate", type=float, default=30, help="Frame rate for sending video.")
+    parser.add_argument("--frame-rate", type=float, default=100, help="Frame rate for sending video.")
     parser.add_argument("--sequential", type=bool, default=True, help="Sender waits until the result of the previous frame is received.")
-    parser.add_argument("--compress", type=str, default="none", help="Compress video frames before sending.")
+    parser.add_argument("--compress", type=str, default="h264", help="Compress video frames before sending.")
 
     args = parser.parse_args()
 

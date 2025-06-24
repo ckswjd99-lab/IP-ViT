@@ -123,7 +123,9 @@ def thread_receive_video(
                 continue
 
             # receive motion vectors
-            mvs = bytes_to_ndarray(receive_data(socket_rx))
+            M_cur_prev = bytes_to_ndarray(receive_data(socket_rx))
+            if M_cur_prev.mean() == -1:
+                M_cur_prev = None
         
         else:
             frame = bytes_to_ndarray(receive_data(socket_rx))
@@ -144,7 +146,7 @@ def thread_receive_video(
             # try image refinement
             if compress == "h264":
                 # get the affine matrix and accumulate to the previous one
-                M_cur_prev = rigid_from_mvs(mvs)
+                # M_cur_prev = rigid_from_mvs(mvs)
                 if M_cur_prev is not None:
                     H_cur_prev = np.vstack([M_cur_prev, [0,0,1]])
                     cum_H = prev_H @ H_cur_prev

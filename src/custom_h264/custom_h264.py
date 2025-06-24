@@ -19,7 +19,7 @@ _lib_path = os.path.join(os.path.dirname(__file__), "libcustom_h264.so")
 lib = ctypes.CDLL(_lib_path)
 
 # 함수 시그니처 지정
-lib.mv_init.argtypes    = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+lib.mv_init.argtypes    = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 lib.mv_init.restype     = ctypes.c_int
 lib.mv_process.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(MVInfo), ctypes.c_int]
 lib.mv_process.restype  = ctypes.c_int
@@ -34,9 +34,11 @@ lib.mv_process_and_encode.argtypes = [
 ]
 lib.mv_process_and_encode.restype = ctypes.c_int
 
-def mv_init(width: int, height: int, fps: int) -> int:
-    """라이브러리 초기화"""
-    return lib.mv_init(width, height, fps)
+def mv_init(width: int, height: int, fps: int, x264_params: str = None) -> int:
+    """라이브러리 초기화. x264_params를 지정하면 ffmpeg/x264 옵션을 직접 전달."""
+    if x264_params is None:
+        x264_params = ""
+    return lib.mv_init(width, height, fps, x264_params.encode("utf-8"))
 
 def mv_process(frame: np.ndarray, max_mv: int = 8192):
     """프레임(BGR np.ndarray)에서 모션 벡터 추출"""

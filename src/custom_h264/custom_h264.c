@@ -4,6 +4,7 @@
 #include <libavutil/opt.h>
 #include <libavutil/motion_vector.h>
 #include <libswscale/swscale.h>
+#include <string.h>
 
 typedef struct {
     int16_t dst_x, dst_y;        // 블록 좌표 (좌상단)
@@ -17,11 +18,12 @@ static struct SwsContext *sws = NULL;
 static AVPacket *pkt = NULL;
 static int pts = 0;
 
-static const char *X264_PARAMS =
+// 원본 코드에서 사용한 h264 파라미터를 default로 사용
+static const char *DEFAULT_X264_PARAMS =
     "keyint=9999:min-keyint=9999:no-scenecut=1:bframes=0:"
     "ref=1:partitions=i16x16,p16x16:8x8dct=0:rc-lookahead=0";
 
-int mv_init(int w, int h, int fps)
+int mv_init(int w, int h, int fps, const char* x264_params)
 {
     const AVCodec *enc_c = avcodec_find_encoder_by_name("libx264");
     const AVCodec *dec_c = avcodec_find_decoder(AV_CODEC_ID_H264);
@@ -38,7 +40,11 @@ int mv_init(int w, int h, int fps)
     av_opt_set(enc->priv_data,"preset","fast",0);
     av_opt_set(enc->priv_data,"profile","baseline",0);
     av_opt_set(enc->priv_data,"tune","zerolatency",0);
-    av_opt_set(enc->priv_data,"x264-params",X264_PARAMS,0);
+    if (x264_params && strlen(x264_params) > 0)
+        av_opt_set(enc->priv_data,"x264-params", x264_params, 0);
+    else
+        av_opt_set(enc->priv_data,"x264-params", DEFAULT_X264_PARAMS, 0);
+
     if (avcodec_open2(enc,enc_c,NULL)<0) return -1;
 
     av_opt_set_int(dec,"flags2",AV_CODEC_FLAG2_EXPORT_MVS,0);
