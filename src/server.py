@@ -22,6 +22,8 @@ from networking import (
     HEADER_NORMAL, HEADER_TERMINATE,
     connect_dual_tcp, transmit_data, receive_data,
     measure_timelag,
+    bytes_to_int32, int32_to_bytes,
+    bytes_to_bool, bool_to_bytes
 )
 from preprocessing import (
     shift_anchor_features,
@@ -56,175 +58,64 @@ def rigid_from_mvs(mvs: np.ndarray):
 def thread_receive_video(
     socket_rx: socket.socket, 
     frame_queue: Queue,
-    frame_shape: Tuple[int, int],
     queue_recv_timestamp: Queue,
-    queue_preproc_timestamp: Queue,
     compress: str,
-    gop: int,
 ) -> float:
-    import torch.nn.functional as F
-    import torch
-
-    input_size = (1024, 1024)
-    block_size = 16
-    fw, fh = frame_shape
-    center_vec = np.array([input_size[1]/2 - fw/2,
-                input_size[0]/2 - fh/2], dtype=np.float32)
-    prev_H = np.array([[1,0,center_vec[0]],
-                      [0,1,center_vec[1]],
-                      [0,0,1]], dtype=np.float32)
-
-    anchor_image_padded = None
-
+    decoder = None
     if compress == "h264":
-        codec = av.codec.CodecContext.create('h264', 'r')
-        packet_buffer = []
+        decoder = av.codec.CodecContext.create("h264", "r")
 
     while True:
-        # Receive frame idx
         data = receive_data(socket_rx)
         if data is None:
             break
 
-        fidx = int.from_bytes(data[:4], 'big')
+        fidx     = bytes_to_int32(data)
+        refresh  = bytes_to_bool(receive_data(socket_rx))
+        dmap     = bytes_to_ndarray(receive_data(socket_rx))
+        shift_x  = bytes_to_int32(receive_data(socket_rx))
+        shift_y  = bytes_to_int32(receive_data(socket_rx))
+        blk_size = bytes_to_int32(receive_data(socket_rx))
 
-        if compress == "jpeg":
-            data = bytes_to_ndarray(receive_data(socket_rx))
-            frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        
+        # ── anchor_image_padded 복원 ─────────────────────────────
+        if compress == "none":
+            anchor_img = bytes_to_ndarray(receive_data(socket_rx))
+
+        elif compress == "jpeg":
+            arr = np.frombuffer(receive_data(socket_rx), dtype=np.uint8)
+            anchor_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
         elif compress == "h264":
-            # 1. 인코딩된 바이트 수신
-            data = receive_data(socket_rx)
-            # 2. 패킷 누적 및 디코딩
-            packet = av.Packet(data)
-            frames = []
-            try:
-                frames = codec.decode(packet)
-            except Exception as e:
-                print(f"Decode error: {e}")
-            # 3. 프레임이 없으면 이전 패킷들과 함께 누적해서 decode 시도
-            if not frames:
-                print(f"Warning: No frames decoded at fidx={fidx}, buffering packet.")
-                # 패킷 버퍼에 추가
-                packet_buffer.append(packet)
-                # 누적된 패킷으로 decode 시도
-                for pkt in packet_buffer:
-                    try:
-                        frames += codec.decode(pkt)
-                    except Exception as e:
-                        print(f"Decode error (buffer): {e}")
-                # 버퍼 비우기
-                packet_buffer = []
-            # 4. 프레임이 있으면 첫 번째 프레임 사용
-            if frames:
-                frame = frames[0].to_ndarray(format='bgr24')
-            else:
-                print(f"Warning: No frame decoded at fidx={fidx}, skipping.")
-                continue
+            # *** 순서 교정: 먼저 pkt_count 읽기 ***
+            pkt_cnt = bytes_to_int32(receive_data(socket_rx))
+            frames  = []
+            for _ in range(pkt_cnt):
+                pkt_bytes = receive_data(socket_rx)
+                frames.extend(decoder.decode(av.Packet(pkt_bytes)))
 
-            # receive motion vectors
-            M_cur_prev = bytes_to_ndarray(receive_data(socket_rx))
-            if M_cur_prev.mean() == -1:
-                M_cur_prev = None
+            if not frames:                           # 혹시 버퍼링 남았다면 flush
+                frames.extend(decoder.decode(None))
+            anchor_img = frames[0].to_ndarray(format="bgr24")
+
+        # -------------------------------------------------------
+        queue_recv_timestamp.put(time.time())
+        frame_queue.put((fidx, refresh, anchor_img, dmap,
+                         (shift_x, shift_y), blk_size))
+
         
-        else:
-            frame = bytes_to_ndarray(receive_data(socket_rx))
-        
-        recv_timestamp = time.time()
-        print(f"Received {fidx} | shape: {frame.shape} | timestamp: {recv_timestamp}")
-        queue_recv_timestamp.put(recv_timestamp)
+        if compress == "h264":
+            pkt_cnt = bytes_to_int32(receive_data(socket_rx))
+            frames  = []
+            for _ in range(pkt_cnt):
+                pkt_bytes = receive_data(socket_rx)
+                frames.extend(decoder.decode(av.Packet(pkt_bytes)))
 
-        target_ndarray = cv2.resize(frame, frame_shape)
+            if not frames:                           # 혹시 버퍼링 남았다면 flush
+                frames.extend(decoder.decode(None))
 
-        # Preprocess the frame
-        refresh = False
-        shift_x, shift_y = 0, 0
+    frame_queue.put((-1, None, None, None, (None, None), None))
 
-        if fidx % gop == 0 or anchor_image_padded is None:
-            refresh = True
-        else:
-            # try image refinement
-            if compress == "h264":
-                # get the affine matrix and accumulate to the previous one
-                # M_cur_prev = rigid_from_mvs(mvs)
-                if M_cur_prev is not None:
-                    H_cur_prev = np.vstack([M_cur_prev, [0,0,1]])
-                    cum_H = prev_H @ H_cur_prev
-                    prev_H = cum_H.copy()
-                    affine_matrix = cum_H[:2, :].copy()
 
-                else:
-                    refresh = True
-                    affine_matrix = None
-                
-            else:
-                # affine_matrix = estimate_affine_in_padded_anchor(anchor_image_padded, frame)
-                affine_matrix = estimate_affine_in_padded_anchor_fast(
-                    anchor_image_padded, target_ndarray
-                )
-            
-            if affine_matrix is not None:
-                target_padded_ndarray, (shift_x, shift_y), affine_matrix = apply_affine_and_pad(
-                    target_ndarray, affine_matrix, 
-                    block_size=block_size,
-                    filling_color=PAD_FILLING_COLOR,
-                )
-
-                # Update the previous affine matrix
-                prev_H = np.vstack([
-                    affine_matrix, [0, 0, 1]
-                ])
-                anchor_image_padded = anchor_image_padded.copy()
-                anchor_image_padded = np.roll(anchor_image_padded, shift=(-shift_x, -shift_y), axis=(1, 0))
-                
-                if target_padded_ndarray is not None:
-                    scaling_factor = np.linalg.norm(affine_matrix[:2, :2])
-                    dirtiness_map = create_dirtiness_map(anchor_image_padded, target_padded_ndarray)
-                else:
-                    print("Affine estimation failed, using default dirtiness map.")
-                    target_padded_ndarray = get_padded_image(
-                        target_ndarray, input_size, filling_color=PAD_FILLING_COLOR
-                    )
-                    dirtiness_map = torch.ones(1, 64, 64, 1)
-                    scaling_factor = 1.0
-
-                    prev_H = np.array([[1,0,center_vec[0]],
-                                    [0,1,center_vec[1]],
-                                    [0,0,1]], dtype=np.float32)
-            
-            refresh |= (target_padded_ndarray is None)
-            refresh |= (scaling_factor < 0.95)
-        
-        if refresh:
-            dirtiness_map = torch.ones(1, 64, 64, 1)
-            target_padded_ndarray = get_padded_image(
-                target_ndarray, input_size, filling_color=PAD_FILLING_COLOR
-            )
-            prev_H = np.array([[1,0,center_vec[0]],
-                              [0,1,center_vec[1]],
-                              [0,0,1]], dtype=np.float32)
-        
-        # Resize the dirtiness map
-        dmap_resized = dirtiness_map.cpu().numpy()
-        dmap_resized = cv2.resize(dmap_resized[0, :, :, 0], (input_size[1], input_size[0]))
-        dmap_resized = np.expand_dims(dmap_resized, axis=-1)    # (1024, 1024, 1)
-        dmap_resized = np.concatenate([dmap_resized] * 3, axis=-1)  # (1024, 1024, 3)
-
-        if anchor_image_padded is None:
-            anchor_image_padded = target_padded_ndarray
-        else:
-            anchor_image_padded = dmap_resized * target_padded_ndarray + (1 - dmap_resized) * anchor_image_padded
-            anchor_image_padded = anchor_image_padded.astype(np.uint8)
-
-        queue_preproc_timestamp.put(time.time())
-
-        # Put the frame into the queue
-        frame_queue.put((
-            fidx, refresh, anchor_image_padded, dirtiness_map.cpu().numpy(),
-            (shift_x // block_size, shift_y // block_size), block_size,
-        ))
-
-    frame_queue.put((-1, None, None, None, (None, None), None))  # Send termination signal
     
 
 def thread_process_video(
@@ -425,7 +316,6 @@ def main(args):
     result_queue = Queue(maxsize=100)
 
     queue_recv_timestamp = Queue(maxsize=100)
-    queue_preproc_timestamp = Queue(maxsize=100)
     queue_proc_timestamp = Queue(maxsize=100)
 
     thread_recv = Process(
@@ -433,11 +323,8 @@ def main(args):
         args=(
             socket_rx, 
             frame_queue,
-            frame_shape,
             queue_recv_timestamp, 
-            queue_preproc_timestamp,
             compress,
-            gop,
         )
     )
     thread_proc = Process(
@@ -470,6 +357,7 @@ def main(args):
 
     # Receive statistics
     transmit_times = bytes_to_ndarray(receive_data(socket_rx)) + timelag
+    preproc_times = bytes_to_ndarray(receive_data(socket_rx)) + timelag
     result_times = bytes_to_ndarray(receive_data(socket_rx)) + timelag
 
     # Process statistics
@@ -477,11 +365,6 @@ def main(args):
     while not queue_recv_timestamp.empty():
         receive_times.append(queue_recv_timestamp.get())
     receive_times = np.array(receive_times)
-
-    preproc_times = []
-    while not queue_preproc_timestamp.empty():
-        preproc_times.append(queue_preproc_timestamp.get())
-    preproc_times = np.array(preproc_times)
 
     proc_times = []
     while not queue_proc_timestamp.empty():
@@ -492,21 +375,21 @@ def main(args):
     latencies = [receive - transmit for transmit, receive in zip(transmit_times, result_times)]
     print(f"Average latency: {np.mean(latencies):.4f} seconds")
 
-    ### avg transfer latency
-    transfer_latencies = [
-        receive - transmit for transmit, receive in zip(transmit_times, receive_times)
-    ]
-    print(f" > Average transfer latency: {np.mean(transfer_latencies):.4f} seconds")
-
     ### avg preproc latency
     preproc_latencies = [
-        preproc - receive for preproc, receive in zip(preproc_times, receive_times)
+        preproc - transmit for transmit, preproc in zip(transmit_times, preproc_times)
     ]
     print(f" > Average preproc latency: {np.mean(preproc_latencies):.4f} seconds")
 
+    ### avg transfer latency
+    transfer_latencies = [
+        receive - preproc for preproc, receive in zip(preproc_times, receive_times)
+    ]
+    print(f" > Average transfer latency: {np.mean(transfer_latencies):.4f} seconds")
+
     ### avg proc latency
     proc_latencies = [
-        proc - preproc for proc, preproc in zip(proc_times, preproc_times)
+        proc - receive for proc, receive in zip(proc_times, receive_times)
     ]
     print(f" > Average proc latency: {np.mean(proc_latencies):.4f} seconds")
     

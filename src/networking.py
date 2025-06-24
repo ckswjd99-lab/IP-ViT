@@ -206,3 +206,14 @@ if __name__ == "__main__":
     socket_tx.close()
     print("Sockets closed.")
 
+def int32_to_bytes(val: int) -> bytes:
+    return val.to_bytes(4, "big", signed=True)
+
+def bytes_to_int32(b: bytes) -> int:
+    return int.from_bytes(b, "big", signed=True)
+
+def bool_to_bytes(flag: bool) -> bytes:
+    return (1 if flag else 0).to_bytes(1, "big")
+
+def bytes_to_bool(b: bytes) -> bool:
+    return bool(int.from_bytes(b, "big"))
