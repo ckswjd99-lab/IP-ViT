@@ -30,30 +30,12 @@ from preprocessing import (
     estimate_affine_in_padded_anchor,
     estimate_affine_in_padded_anchor_fast,
     apply_affine_and_pad, get_padded_image,
-    create_dirtiness_map
+    create_dirtiness_map,
+    create_dirtiness_map_percentage,
+    rigid_from_mvs
 )
 
 from custom_h264 import custom_h264
-
-
-def rigid_from_mvs(mvs: np.ndarray):
-    """
-    모션벡터(N, 5) → 현재 프레임 ➜ 참조(이전) 프레임으로 가는 2×3 rigid 변환 추정.
-    실패 시 None 반환.
-    """
-    if mvs is None or mvs.shape[0] < 3 or mvs.shape[1] != 5:
-        return None
-    # mvs: [dst_x, dst_y, motion_x, motion_y, motion_scale]
-    dst = mvs[:, 0:2].astype(np.float32)
-    src = dst + (mvs[:, 2:4] / mvs[:, 4:5]).astype(np.float32)
-    if dst.shape[0] < 3 or src.shape[0] < 3:
-        return None
-    M, _ = cv2.estimateAffinePartial2D(dst, src,
-                                       method=cv2.RANSAC,
-                                       ransacReprojThreshold=2.0,
-                                       confidence=0.995,
-                                       refineIters=10)
-    return M                                                   # shape (2,3) or None
 
 
 def thread_send_video(
@@ -150,6 +132,8 @@ def thread_send_video(
                     scaling_factor = np.linalg.norm(affine_matrix[:2, :2])
                     dirtiness_map = create_dirtiness_map(
                         anchor_image_padded, target_padded_ndarray)
+                    # dirtiness_map = create_dirtiness_map_percentage(
+                    #     anchor_image_padded, target_padded_ndarray)
                 else:
                     target_padded_ndarray = get_padded_image(
                         target_ndarray, input_size,
@@ -193,6 +177,7 @@ def thread_send_video(
         transmit_data(socket_tx, int32_to_bytes(shift_x // block_size))
         transmit_data(socket_tx, int32_to_bytes(shift_y // block_size))
         transmit_data(socket_tx, int32_to_bytes(block_size))
+        transmit_data(socket_tx, ndarray_to_bytes(prev_H))
 
         if compress == "none":
             transmit_data(socket_tx, ndarray_to_bytes(anchor_image_padded))
@@ -264,6 +249,7 @@ def main(args):
     server_port1 = args.server_port
     server_port2 = server_port1 + 1
     video_path = args.video_path
+    annotation_path = args.annotation_path
     gop = args.frame_rate
     sequential = args.sequential
     compress = args.compress
@@ -306,12 +292,25 @@ def main(args):
         )
     )
 
+    # Load annotations if needed
+    if annotation_path:
+        try:
+            import json
+            with open(annotation_path, 'r') as f:
+                annotations = json.load(f)
+            print(f"Loaded annotations from {annotation_path}")
+        except Exception as e:
+            print(f"Error loading annotations: {e}")
+            annotations = None
+
     # Send metadata
     metadata = {
         "gop": gop,
         "compress": compress,
         "frame_shape": (854, 480)
     }
+    if annotations:
+        metadata["annotations"] = annotations
     metadata_bytes = str(metadata).encode('utf-8')
     transmit_data(socket_tx, metadata_bytes)
 
@@ -364,7 +363,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Client for sending video to server.")
     parser.add_argument("--server-ip", type=str, default="localhost", help="Server IP address.")
     parser.add_argument("--server-port", type=int, default=65432, help="Server port.")
-    parser.add_argument("--video-path", type=str, default="./input.mp4", help="Path to the video file.")
+    parser.add_argument("--video-path", type=str, default="/data/DAVIS/MP4Videos/480p/bear.mp4", help="Path to the video file.")
+    parser.add_argument("--annotation-path", type=str, default="/data/DAVIS/Annotations_bbox/480p/bear.json", help="Path to the annotation file.")
     parser.add_argument("--frame-rate", type=float, default=100, help="Frame rate for sending video.")
     parser.add_argument("--sequential", type=bool, default=True, help="Sender waits until the result of the previous frame is received.")
     parser.add_argument("--compress", type=str, default="h264", help="Compress video frames before sending.")

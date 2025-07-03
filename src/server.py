@@ -30,29 +30,37 @@ from preprocessing import (
     apply_affine_and_pad, get_padded_image,
     estimate_affine_in_padded_anchor_fast,
     create_dirtiness_map,
-    ndarray_to_bytes, bytes_to_ndarray
+    ndarray_to_bytes, bytes_to_ndarray,
 )
 
 PAD_FILLING_COLOR = [0, 0, 0]  # RGB for padding
 
-def rigid_from_mvs(mvs: np.ndarray):
-    """
-    모션벡터(N, 5) → 현재 프레임 ➜ 참조(이전) 프레임으로 가는 2×3 rigid 변환 추정.
-    실패 시 None 반환.
-    """
-    if mvs is None or mvs.shape[0] < 3 or mvs.shape[1] != 5:
-        return None
-    # mvs: [dst_x, dst_y, motion_x, motion_y, motion_scale]
-    dst = mvs[:, 0:2].astype(np.float32)
-    src = dst + (mvs[:, 2:4] / mvs[:, 4:5]).astype(np.float32)
-    if dst.shape[0] < 3 or src.shape[0] < 3:
-        return None
-    M, _ = cv2.estimateAffinePartial2D(dst, src,
-                                       method=cv2.RANSAC,
-                                       ransacReprojThreshold=2.0,
-                                       confidence=0.995,
-                                       refineIters=10)
-    return M                                                   # shape (2,3) or None
+
+def calculate_iou(target_box, infer_box):
+    x1_gt, y1_gt, x2_gt, y2_gt = target_box
+    x1, y1, x2, y2 = infer_box
+
+    xA = max(x1, x1_gt)
+    yA = max(y1, y1_gt)
+    xB = min(x2, x2_gt)
+    yB = min(y2, y2_gt)
+
+    interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
+
+    boxAArea = (x2 - x1 + 1) * (y2 - y1 + 1)
+    boxBArea = (x2_gt - x1_gt + 1) * (y2_gt - y1_gt + 1)
+
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+
+    return iou
+
+def calculate_multi_iou(target_boxes, target_labels, infer_boxes, infer_labels):
+    iou_results = []
+    for target_box, target_label in zip(target_boxes, target_labels):
+        iou_list = [calculate_iou(target_box, infer_box) for infer_box, infer_label in zip(infer_boxes, infer_labels) if target_label == infer_label or target_label == -1]
+        iou_results.append(max(iou_list) if len(iou_list) > 0 else 0)
+
+    return iou_results
 
 
 def thread_receive_video(
@@ -76,6 +84,7 @@ def thread_receive_video(
         shift_x  = bytes_to_int32(receive_data(socket_rx))
         shift_y  = bytes_to_int32(receive_data(socket_rx))
         blk_size = bytes_to_int32(receive_data(socket_rx))
+        affine_mat = bytes_to_ndarray(receive_data(socket_rx))
 
         # ── anchor_image_padded 복원 ─────────────────────────────
         if compress == "none":
@@ -100,7 +109,7 @@ def thread_receive_video(
         # -------------------------------------------------------
         queue_recv_timestamp.put(time.time())
         frame_queue.put((fidx, refresh, anchor_img, dmap,
-                         (shift_x, shift_y), blk_size))
+                         (shift_x, shift_y), blk_size, affine_mat))
 
         
         if compress == "h264":
@@ -113,7 +122,7 @@ def thread_receive_video(
             if not frames:                           # 혹시 버퍼링 남았다면 flush
                 frames.extend(decoder.decode(None))
 
-    frame_queue.put((-1, None, None, None, (None, None), None))
+    frame_queue.put((-1, None, None, None, (None, None), None, None))
 
 
     
@@ -161,7 +170,7 @@ def thread_process_video(
 
     while True:
         # Fetch frame
-        fidx, refresh, target_ndarray, dirtiness_map, (shift_x, shift_y), block_size = frame_queue.get()
+        fidx, refresh, target_ndarray, dirtiness_map, (shift_x, shift_y), block_size, affine_mat = frame_queue.get()
         if fidx == -1:
             break
 
@@ -207,7 +216,7 @@ def thread_process_video(
         # Send results back to the client
         result_queue.put((
             fidx, target_ndarray, dirtiness_map, boxes, scores, labels, 
-            (shift_x, shift_y), block_size
+            (shift_x, shift_y), block_size, affine_mat
         ))
 
         num_frames += 1
@@ -218,7 +227,7 @@ def thread_process_video(
     print(f"Compute rate: {np.mean(compute_rates)}")
 
     # transmit_data(socket_tx, b"", HEADER_TERMINATE)  # Send termination signal
-    result_queue.put((-1, None, None, None, None, None, (None, None), None))  # Send termination signal
+    result_queue.put((-1, None, None, None, None, None, (None, None), None, None))  # Send termination signal
 
     time.sleep(1)  # Give some time for the send thread to finish
 
@@ -226,20 +235,26 @@ def thread_process_video(
 
 
 def thread_send_result(
-    socket_rx: socket.socket, socket_tx: socket.socket, result_queue: Queue
+    socket_rx: socket.socket, socket_tx: socket.socket, result_queue: Queue, annotations: List = None
 ) -> float:
     """
     """
 
     from models.constants import COCO_LABELS_LIST, COCO_COLORS_ARRAY
 
+    avg_ious = []
+
     cum_shift_x, cum_shift_y = 0, 0
+
+    list_annotations = list(annotations.values()) if annotations is not None else []
 
     while True:
         
         # Receive results from the processing thread
         fidx, target_ndarray, dirtiness_map, boxes, \
-            scores, labels, (shift_x, shift_y), block_size = result_queue.get()
+            scores, labels, (shift_x, shift_y), block_size, affine_mat = result_queue.get()
+
+        bboxes_gt = list_annotations[fidx] if fidx < len(list_annotations) else None
         
         if fidx == -1:
             break
@@ -258,7 +273,24 @@ def thread_send_result(
         target_ndarray[:, :, 1] += dmap_resized * 30
         target_ndarray = np.clip(target_ndarray, 0, 255).astype(np.uint8)
 
-        # make boxes at the frame
+        # make ground truth boxes at the frame
+        bboxes_gt_affined = []
+        if bboxes_gt is not None:
+            # bboxes_gt: List of {'x_min': int, 'y_min': int, 'x_max': int, 'y_max': int, 'label': str}
+            for bbox in bboxes_gt:
+                # apply affine transformation if affine_mat is provided
+                if affine_mat is not None:
+                    bbox = {
+                        'x_min': int(bbox['x_min'] * affine_mat[0, 0] + bbox['y_min'] * affine_mat[0, 1] + affine_mat[0, 2]),
+                        'y_min': int(bbox['x_min'] * affine_mat[1, 0] + bbox['y_min'] * affine_mat[1, 1] + affine_mat[1, 2]),
+                        'x_max': int(bbox['x_max'] * affine_mat[0, 0] + bbox['y_max'] * affine_mat[0, 1] + affine_mat[0, 2]),
+                        'y_max': int(bbox['x_max'] * affine_mat[1, 0] + bbox['y_max'] * affine_mat[1, 1] + affine_mat[1, 2]),
+                    }
+                box = np.array([bbox['x_min'], bbox['y_min'], bbox['x_max'], bbox['y_max']])
+                bboxes_gt_affined.append(box)
+                cv2.rectangle(target_ndarray, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
+
+        # make predicted boxes at the frame
         target_ndarray = target_ndarray.astype(np.uint8)
         for box, score, label in zip(boxes, scores, labels):
             box = box.astype(np.int32)
@@ -267,6 +299,14 @@ def thread_send_result(
         
         # make full frame yellow rect
         cv2.rectangle(target_ndarray, (0, 0), (target_ndarray.shape[1], target_ndarray.shape[0]), (0, 255, 255), 2)
+
+        avg_iou = calculate_multi_iou(
+            bboxes_gt_affined,
+            [-1] * len(bboxes_gt_affined),  # -1 for all labels
+            boxes,
+            labels
+        )
+        avg_ious.append(avg_iou)
 
         # shift the target_ndarray by the shift_x, shift_y
         if shift_x is not None and shift_y is not None:
@@ -282,6 +322,7 @@ def thread_send_result(
 
     transmit_data(socket_tx, b"", HEADER_TERMINATE)  # Send termination signal
 
+    print(f"Average IoU: {np.mean(avg_ious):.4f}")
 
 
 def main(args):
@@ -308,8 +349,9 @@ def main(args):
     gop = metadata.get("gop", 30)
     compress = metadata.get("compress", "none")
     frame_shape = metadata.get("frame_shape", (854, 480))
+    annotations = metadata.get("annotations", None)
 
-    print(f"Received metadata: {metadata}")
+    # print(f"Received metadata: {metadata}")
 
     # Prepare processes
     frame_queue = Queue(maxsize=100)
@@ -342,7 +384,8 @@ def main(args):
         args=(
             socket_rx, 
             socket_tx, 
-            result_queue
+            result_queue,
+            annotations
         )
     )
 

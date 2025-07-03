@@ -89,6 +89,45 @@ def create_dirtiness_map(
 
     return dirtiness_map
 
+def create_dirtiness_map_percentage(
+    anchor_image: np.ndarray, 
+    current_image: np.ndarray,
+    block_size: int = 16,
+    dirty_toprate: float = 0.2,
+    chromakey: np.ndarray = np.array([123.675, 116.28, 103.53], dtype=np.uint8),
+    sensi_map: np.ndarray = None,
+) -> torch.Tensor:
+    residual = cv2.absdiff(anchor_image, current_image)
+    
+    # inside current_image, if there is any pixel with chromakey color, set the residual as 0
+    # chromakey_mask = np.all(current_image == chromakey, axis=-1)
+    # residual[chromakey_mask] = 0
+
+    image_H, image_W = residual.shape[:2]
+
+    dirtiness_map = cv2.cvtColor(residual, cv2.COLOR_BGR2GRAY)
+    dirtiness_map = cv2.resize(dirtiness_map, (image_W // block_size, image_H // block_size), interpolation=cv2.INTER_LINEAR)
+
+    # Calculate the threshold based on the top percentage of dirtiness
+    flat_dirtiness_map = dirtiness_map.flatten()
+    num_blocks = flat_dirtiness_map.size
+    num_dirty_blocks = int(num_blocks * dirty_toprate)
+    if num_dirty_blocks == 0:
+        dirty_thres = 0
+    else:
+        dirty_thres = np.partition(flat_dirtiness_map, -num_dirty_blocks)[-num_dirty_blocks]
+    
+    dirtiness_map = cv2.GaussianBlur(dirtiness_map, (15, 15), 1.5)
+    if sensi_map is None:
+        dirtiness_map = (dirtiness_map > dirty_thres).astype(np.float32)
+    else:
+        dirtiness_map = (dirtiness_map > dirty_thres * (1 - sensi_map)).astype(np.float32)
+
+    dirtiness_map = torch.from_numpy(dirtiness_map).to("cuda")
+    dirtiness_map = dirtiness_map.unsqueeze(0).unsqueeze(-1)
+
+    return dirtiness_map
+
 def estimate_affine_in_padded_anchor(
     anchor_padded_ndarray: np.ndarray,  # (1024, 1024, 3)
     target_ndarray: np.ndarray,         # (H, W, 3)
@@ -398,3 +437,23 @@ def load_video(video_path: str) -> List[np.ndarray]:
 
     cap.release()
     return frames
+
+
+def rigid_from_mvs(mvs: np.ndarray):
+    """
+    모션벡터(N, 5) → 현재 프레임 ➜ 참조(이전) 프레임으로 가는 2×3 rigid 변환 추정.
+    실패 시 None 반환.
+    """
+    if mvs is None or mvs.shape[0] < 3 or mvs.shape[1] != 5:
+        return None
+    # mvs: [dst_x, dst_y, motion_x, motion_y, motion_scale]
+    dst = mvs[:, 0:2].astype(np.float32)
+    src = dst + (mvs[:, 2:4] / mvs[:, 4:5]).astype(np.float32)
+    if dst.shape[0] < 3 or src.shape[0] < 3:
+        return None
+    M, _ = cv2.estimateAffinePartial2D(dst, src,
+                                       method=cv2.RANSAC,
+                                       ransacReprojThreshold=2.0,
+                                       confidence=0.995,
+                                       refineIters=10)
+    return M                                                   # shape (2,3) or None
